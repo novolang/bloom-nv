@@ -1,0 +1,322 @@
+// blbloom.nv — the Bloom filter.
+//
+// WHAT IT IS
+//
+// A Bloom filter answers one question — "have I seen this?" — in a few
+// bits per item, and it answers it with a one-sided error.  `false`
+// means the item was definitely never added.  `true` means it probably
+// was: with probability at most the rate the filter was sized for, it
+// is a FALSE POSITIVE and the item was never added at all.
+//
+// There are no false negatives, ever, and that is what makes the
+// structure useful: a caller can skip the expensive lookup whenever
+// the filter says `false`, and be certain it skipped nothing real.
+// Burton Bloom's 1970 paper is the original.
+//
+// SIZING IS THE WHOLE DECISION
+//
+// Two numbers fix everything: how many items are expected, and what
+// false-positive rate is acceptable.  From those the optimal bit count
+// is `-n ln p / (ln 2)^2` and the optimal hash count is
+// `(m / n) ln 2` — about ten bits per item for one per cent, fifteen
+// for one per thousand.  `new` does that arithmetic, and `with_bits`
+// is for a caller matching another implementation's parameters.
+//
+// PUT MORE IN THAN IT WAS SIZED FOR AND THE RATE CLIMBS
+//
+// Nothing breaks and nothing is refused; the filter just becomes less
+// useful, silently.  `false_positive_rate` answers the rate at the
+// current fill rather than the target, and `is_saturated` is the
+// question a caller should be asking on a schedule.
+//
+// ONE HASH IS ENOUGH
+//
+// The filter needs `k` independent positions per item, and it gets
+// them from one 64-bit hash by the construction of Kirsch and
+// Mitzenmacher (2006): the two halves of the hash are combined as
+// `h1 + i * h2`.  So the caller supplies one `fn(Bytes) -> Int`, and
+// the same hash label rule as everywhere: it is carried, compared on a
+// union, and interpreted nowhere.
+
+use blfault
+
+// A Bloom filter.
+pub struct BloomFilter
+    // How many bits the filter has.
+    bits: Int
+    // How many positions each item sets.
+    hashes: Int
+    // The label the caller gave for the hash the filter was fed
+    // through.
+    hash_id: Str
+    // How many items the filter was sized for.
+    capacity: Int
+    // The bits themselves, eight to a byte.
+    bitmap: Bytes
+    // How many items have been added, which is what the current
+    // false-positive rate is computed from.
+    inserted: Int
+
+// An empty filter sized for `capacity` items at a false-positive rate
+// of `target`.
+//
+// `target` is a fraction in `0.0 ..< 1.0`: `0.01` is one per cent.
+// The bit count and the hash count are computed from the two, and a
+// caller that cares about the memory reads `bit_count` back.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blbloom.hash_count(f)}")     // 7
+//         Err(e) => println(e.message())
+// ```
+pub fn new(capacity: Int, target: Float, hash_id: Str) -> Result<BloomFilter, blfault.BlFault>
+    todo("bloom-nv.blbloom.new")
+
+// An empty filter with the bit count and hash count given directly.
+//
+// For a caller matching another implementation's parameters, or one
+// that has a fixed amount of memory and wants to know what rate it
+// buys.  `false_positive_rate` answers that.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.with_bits(9600, 7, "xxh3")
+//         Ok(f)  => println("${blbloom.bit_count(f)}")      // 9600
+//         Err(e) => println(e.message())
+// ```
+pub fn with_bits(bits: Int, hashes: Int, hash_id: Str) -> Result<BloomFilter, blfault.BlFault>
+    todo("bloom-nv.blbloom.with_bits")
+
+// The filter with one item added.
+//
+// Adding an item twice changes nothing: the bits are already set.
+// That is why a Bloom filter cannot count, and why `inserted_count` is
+// what was offered rather than what is distinct.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "test")
+//         Err(e) => println(e.message())
+//         Ok(f)  =>
+//             let one = blbloom.add(f, bytes.from_str("ada"), demo_hash)
+//             println("${blbloom.contains(one, bytes.from_str("ada"), demo_hash)}")
+//
+// fn demo_hash(b: Bytes) -> Int
+//     bytes.len(b) * 2654435761
+// ```
+pub fn add(f: BloomFilter, item: Bytes, hash: fn(Bytes) -> Int) -> BloomFilter
+    todo("bloom-nv.blbloom.add")
+
+// The filter with one already-hashed item added.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blbloom.inserted_count(blbloom.add_hashed(f, 981723))}")
+//         Err(e) => println(e.message())
+// ```
+pub fn add_hashed(f: BloomFilter, hashed: Int) -> BloomFilter
+    todo("bloom-nv.blbloom.add_hashed")
+
+// Whether the item may have been added.
+//
+// `false` is certain: the item was never added.  `true` is probable,
+// and wrong with at most the probability `false_positive_rate`
+// answers.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "test")
+//         Err(e) => println(e.message())
+//         Ok(f)  => println("${blbloom.contains(f, bytes.from_str("ada"), demo_hash)}")
+//
+// fn demo_hash(b: Bytes) -> Int
+//     bytes.len(b) * 2654435761
+// ```
+pub fn contains(f: BloomFilter, item: Bytes, hash: fn(Bytes) -> Int) -> Bool
+    todo("bloom-nv.blbloom.contains")
+
+// Whether an already-hashed item may have been added.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blbloom.contains_hashed(f, 981723)}")    // false
+//         Err(e) => println(e.message())
+// ```
+pub fn contains_hashed(f: BloomFilter, hashed: Int) -> Bool
+    todo("bloom-nv.blbloom.contains_hashed")
+
+// The false-positive rate at the current fill.
+//
+// `(1 - e^(-k n / m))^k`, with `n` the number of items added.  An
+// empty filter answers `0.0`, a filter at its capacity answers about
+// its target, and a filter past its capacity answers a number that
+// keeps climbing — which is the number a caller should act on rather
+// than the target it was built with.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blbloom.false_positive_rate(f)}")        // 0
+//         Err(e) => println(e.message())
+// ```
+pub fn false_positive_rate(f: BloomFilter) -> Float
+    todo("bloom-nv.blbloom.false_positive_rate")
+
+// The rate the filter was sized for, or `0.0` when it was built with
+// `with_bits`.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blbloom.target_rate(f) == 0.01}")        // true
+//         Err(e) => println(e.message())
+// ```
+pub fn target_rate(f: BloomFilter) -> Float
+    todo("bloom-nv.blbloom.target_rate")
+
+// Whether more items have been added than the filter was sized for.
+//
+// The filter still works; its false-positive rate is simply above the
+// target.  A caller checks this on a schedule and rebuilds at a larger
+// size, because nothing else will tell it.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blbloom.is_saturated(f)}")   // false
+//         Err(e) => println(e.message())
+// ```
+pub fn is_saturated(f: BloomFilter) -> Bool
+    todo("bloom-nv.blbloom.is_saturated")
+
+// How many bits the filter has.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blbloom.bit_count(f) > 9000}")           // true
+//         Err(e) => println(e.message())
+// ```
+pub fn bit_count(f: BloomFilter) -> Int
+    todo("bloom-nv.blbloom.bit_count")
+
+// How many positions each item sets.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blbloom.hash_count(f)}")     // 7
+//         Err(e) => println(e.message())
+// ```
+pub fn hash_count(f: BloomFilter) -> Int
+    todo("bloom-nv.blbloom.hash_count")
+
+// How many items have been added.
+//
+// What was offered, not what is distinct: a Bloom filter cannot tell
+// the difference.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blbloom.inserted_count(f)}")  // 0
+//         Err(e) => println(e.message())
+// ```
+pub fn inserted_count(f: BloomFilter) -> Int
+    todo("bloom-nv.blbloom.inserted_count")
+
+// The filter that holds everything both hold.
+//
+// A bitwise OR, and it is exact: the union of two filters is the
+// filter that would have had both streams added to it.  Refused when
+// the shapes or the hash labels differ.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Err(e) => println(e.message())
+//         Ok(f)  =>
+//             match blbloom.union(f, f)
+//                 Ok(u)  => println("${blbloom.inserted_count(u)}")     // 0
+//                 Err(e) => println(e.message())
+// ```
+pub fn union(a: BloomFilter, b: BloomFilter) -> Result<BloomFilter, blfault.BlFault>
+    todo("bloom-nv.blbloom.union")
+
+// The filter of the items both hold — a bitwise AND, and NOT exact.
+//
+// The result answers `true` for any item whose bits happen to be set
+// in both filters for different reasons, so its false-positive rate is
+// higher than either input's and is not bounded by the target.  It is
+// here because a caller sometimes needs it anyway, and the number it
+// must not trust is `false_positive_rate`, which is computed from a
+// fill this operation invalidates.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Err(e) => println(e.message())
+//         Ok(f)  =>
+//             match blbloom.intersection(f, f)
+//                 Ok(i)  => println("${blbloom.bit_count(i) > 0}")      // true
+//                 Err(e) => println(e.message())
+// ```
+pub fn intersection(a: BloomFilter, b: BloomFilter) -> Result<BloomFilter, blfault.BlFault>
+    todo("bloom-nv.blbloom.intersection")
+
+// The filter as bytes, carrying its shape and hash label.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${bytes.len(blbloom.to_bytes(f)) > 0}")    // true
+//         Err(e) => println(e.message())
+// ```
+pub fn to_bytes(f: BloomFilter) -> Bytes
+    todo("bloom-nv.blbloom.to_bytes")
+
+// A filter read back from bytes.
+//
+// ```novo
+// use blbloom
+//
+// fn main() [io]
+//     match blbloom.from_bytes(bytes.from_str(""))
+//         Ok(f)  => println("${blbloom.bit_count(f)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn from_bytes(b: Bytes) -> Result<BloomFilter, blfault.BlFault>
+    todo("bloom-nv.blbloom.from_bytes")

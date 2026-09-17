@@ -1,0 +1,144 @@
+// blbloom_tests.nv — the API suite for the plain filter.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// bloom-nv.blbloom.<fn>`.  What is asserted is the one-sided error —
+// `false` is certain and `true` is probable — the sizing arithmetic,
+// and that a union across two different shapes or hashes is refused.
+
+use std.test
+use blbloom
+use blfault
+
+// A hash the suite can predict.  What matters is that one function is
+// used throughout one filter.
+fn fixed_hash(b: Bytes) -> Int
+    bytes.len(b) * 2654435761
+
+@test
+fn test_false_is_certain_and_true_is_probable() [io]
+    match blbloom.new(1000, 0.01, "test")
+        Err(e) => test.fail("1000 items at 1% is a filter: ${e.message()}")
+        Ok(f)  =>
+            test.case("an empty filter holds nothing, and says so with certainty")
+            test.assert(blbloom.contains(f, bytes.from_str("ada"), fixed_hash) == false)
+            test.assert(blbloom.inserted_count(f) == 0)
+            test.assert(blbloom.false_positive_rate(f) == 0.0)
+
+            test.case("an item that was added is always found — there are no false negatives")
+            let one = blbloom.add(f, bytes.from_str("ada"), fixed_hash)
+            test.assert(blbloom.contains(one, bytes.from_str("ada"), fixed_hash))
+
+            test.case("adding it twice changes nothing but the count of what was offered")
+            let twice = blbloom.add(one, bytes.from_str("ada"), fixed_hash)
+            test.assert(blbloom.inserted_count(twice) == 2)
+            test.assert(blbloom.contains(twice, bytes.from_str("ada"), fixed_hash))
+
+            test.case("and an already-hashed item takes the same path")
+            test.assert(blbloom.contains_hashed(blbloom.add_hashed(f, 981723), 981723))
+
+@test
+fn test_the_sizing_is_the_whole_decision() [io]
+    test.case("1000 items at 1% is about ten bits each and seven hashes")
+    match blbloom.new(1000, 0.01, "test")
+        Err(e) => test.fail("1000 items at 1% is a filter: ${e.message()}")
+        Ok(f)  =>
+            test.assert(blbloom.bit_count(f) == 9586)
+            test.assert(blbloom.hash_count(f) == 7)
+            test.assert(blbloom.target_rate(f) == 0.01)
+
+    test.case("a tenfold better rate costs half as much again, not ten times")
+    match blbloom.new(1000, 0.001, "test")
+        Err(e) => test.fail("1000 items at 0.1% is a filter: ${e.message()}")
+        Ok(f)  => test.assert(blbloom.bit_count(f) == 14378)
+
+    test.case("a caller matching another implementation gives the parameters directly")
+    match blbloom.with_bits(9586, 7, "test")
+        Err(e) => test.fail("9586 bits and 7 hashes is a filter: ${e.message()}")
+        Ok(f)  =>
+            test.assert(blbloom.bit_count(f) == 9586)
+            test.assert(blbloom.target_rate(f) == 0.0)
+
+    test.case("a rate of zero would need an exact set, and is refused")
+    match blbloom.new(1000, 0.0, "test")
+        Ok(_)  => test.fail("no filter has a false-positive rate of zero")
+        Err(e) => test.assert(blfault.code(e) == "target_out_of_range")
+
+    test.case("and a rate of one is a filter that says yes to everything")
+    match blbloom.new(1000, 1.0, "test")
+        Ok(_)  => test.fail("a rate of one is not a filter")
+        Err(e) => test.assert(blfault.code(e) == "target_out_of_range")
+
+    test.case("a capacity of zero has no size to compute from")
+    match blbloom.new(0, 0.01, "test")
+        Ok(_)  => test.fail("a filter for no items has no size")
+        Err(e) => test.assert(blfault.code(e) == "capacity_not_positive")
+
+@test
+fn test_overfilling_is_silent_unless_the_caller_asks() [io]
+    match blbloom.new(2, 0.01, "test")
+        Err(e) => test.fail("2 items at 1% is a filter: ${e.message()}")
+        Ok(f)  =>
+            test.case("a filter within its capacity is not saturated")
+            let one = blbloom.add(f, bytes.from_str("a"), fixed_hash)
+            test.assert(blbloom.is_saturated(one) == false)
+
+            test.case("past it, nothing is refused and nothing complains")
+            let over = blbloom.add(blbloom.add(one, bytes.from_str("b"), fixed_hash),
+                                   bytes.from_str("c"), fixed_hash)
+            test.assert(blbloom.is_saturated(over))
+
+            test.case("but the CURRENT rate is above the target, and that is the number to act on")
+            test.assert(blbloom.false_positive_rate(over) > blbloom.target_rate(over))
+
+            test.case("and there are still no false negatives, whatever the fill")
+            test.assert(blbloom.contains(over, bytes.from_str("a"), fixed_hash))
+
+@test
+fn test_a_union_is_exact_and_an_intersection_is_not() [io]
+    match blbloom.new(1000, 0.01, "xxh3")
+        Err(e) => test.fail("1000 items at 1% is a filter: ${e.message()}")
+        Ok(a)  =>
+            test.case("the union holds everything both filters hold")
+            let x = blbloom.add_hashed(a, 11)
+            let y = blbloom.add_hashed(a, 22)
+            match blbloom.union(x, y)
+                Err(e) => test.fail("identical shapes unite: ${e.message()}")
+                Ok(u)  =>
+                    test.assert(blbloom.contains_hashed(u, 11))
+                    test.assert(blbloom.contains_hashed(u, 22))
+                    test.assert(blbloom.inserted_count(u) == 2)
+
+            test.case("an intersection is a bitwise AND, and its rate is not bounded")
+            match blbloom.intersection(x, y)
+                Err(e) => test.fail("identical shapes intersect: ${e.message()}")
+                Ok(i)  => test.assert(blbloom.bit_count(i) == blbloom.bit_count(x))
+
+            test.case("two different shapes do not line up, and are refused")
+            match blbloom.with_bits(4096, 7, "xxh3")
+                Err(e) => test.fail("4096 bits and 7 hashes is a filter: ${e.message()}")
+                Ok(b)  =>
+                    match blbloom.union(a, b)
+                        Ok(_)  => test.fail("bitmaps of different sizes do not unite")
+                        Err(e) => test.assert(blfault.code(e) == "shape_mismatch")
+
+            test.case("and two different hashes would produce a false NEGATIVE, so they are refused")
+            match blbloom.new(1000, 0.01, "sha256")
+                Err(e) => test.fail("1000 items at 1% is a filter: ${e.message()}")
+                Ok(c)  =>
+                    match blbloom.union(a, c)
+                        Ok(_)  => test.fail("one item sets different bits under two hashes")
+                        Err(e) => test.assert(blfault.code(e) == "hash_mismatch")
+
+            test.case("a filter round-trips through bytes and unites with its original")
+            match blbloom.from_bytes(blbloom.to_bytes(x))
+                Err(e) => test.fail("what `to_bytes` wrote reads back: ${e.message()}")
+                Ok(r)  =>
+                    test.assert(blbloom.contains_hashed(r, 11))
+                    match blbloom.union(x, r)
+                        Err(e) => test.fail("a round trip keeps the shape: ${e.message()}")
+                        Ok(u)  => test.assert(blbloom.contains_hashed(u, 11))
+
+    test.case("bytes that are not a filter are refused, naming why")
+    match blbloom.from_bytes(bytes.from_str("not a filter"))
+        Ok(_)  => test.fail("this is not a serialised filter")
+        Err(e) => test.assert(blfault.code(e) == "bad_serialised_form")

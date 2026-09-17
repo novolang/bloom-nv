@@ -1,0 +1,222 @@
+// blcounting.nv — the counting Bloom filter, which can forget.
+//
+// WHAT IT ADDS
+//
+// A plain Bloom filter cannot remove an item: clearing its bits would
+// clear bits that other items set, and the filter would start
+// answering `false` for things it holds — a false NEGATIVE, which is
+// the one answer these structures promise never to give.
+//
+// A counting filter replaces each bit with a small counter.  Adding
+// increments, removing decrements, and a position is "set" while its
+// counter is above zero.  Removal becomes safe, and the price is the
+// counter width: four bits each here, so sixteen times the memory of
+// the plain filter's one bit.
+//
+// TWO WAYS TO BREAK IT, AND BOTH ARE REFUSED
+//
+// A counter that reaches its maximum cannot be incremented again
+// without wrapping to zero, and a wrapped counter makes a later
+// `remove` clear a position that other items need.  So an `add` that
+// would overflow is refused.
+//
+// Removing an item that was never added decrements counters that
+// belong to other items, with the same result.  A filter cannot tell
+// whether an item was truly added — that is what a probabilistic
+// structure means — but it CAN tell that at least one of the item's
+// counters is zero, and that is a certain proof it was never added.
+// `remove` refuses on that proof.
+//
+// The residual risk is a remove of an item that was never added but
+// collides with ones that were.  Nothing can detect that, and the
+// README says so.
+
+use blfault
+
+// A counting Bloom filter, with four-bit counters.
+pub struct BlCountingFilter
+    // How many counters the filter has.
+    slots: Int
+    // How many counters each item touches.
+    hashes: Int
+    // The label the caller gave for the hash.
+    hash_id: Str
+    // How many items the filter was sized for.
+    capacity: Int
+    // The counters, two to a byte.
+    counters: Bytes
+    // How many items are currently in the filter: added, less
+    // removed.
+    present: Int
+
+// An empty counting filter sized for `capacity` items at a rate of
+// `target`.
+//
+// The sizing is the plain filter's; the memory is sixteen times as
+// much, because each bit becomes a four-bit counter.
+//
+// ```novo
+// use blcounting
+//
+// fn main() [io]
+//     match blcounting.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blcounting.hash_count(f)}")  // 7
+//         Err(e) => println(e.message())
+// ```
+pub fn new(capacity: Int, target: Float, hash_id: Str) -> Result<BlCountingFilter, blfault.BlFault>
+    todo("bloom-nv.blcounting.new")
+
+// The filter with one item added.
+//
+// Refused when one of the item's counters is already at fifteen: the
+// next increment would wrap, and a wrapped counter turns a later
+// `remove` into a false negative.
+//
+// ```novo
+// use blcounting
+//
+// fn main() [io]
+//     match blcounting.new(1000, 0.01, "test")
+//         Err(e) => println(e.message())
+//         Ok(f)  =>
+//             match blcounting.add(f, bytes.from_str("ada"), demo_hash)
+//                 Ok(g)  => println("${blcounting.present_count(g)}")   // 1
+//                 Err(e) => println(e.message())
+//
+// fn demo_hash(b: Bytes) -> Int
+//     bytes.len(b) * 2654435761
+// ```
+pub fn add(f: BlCountingFilter, item: Bytes,
+           hash: fn(Bytes) -> Int) -> Result<BlCountingFilter, blfault.BlFault>
+    todo("bloom-nv.blcounting.add")
+
+// The filter with one item removed.
+//
+// Refused when any of the item's counters is zero, which is certain
+// proof the item was never added.  A remove that got through anyway —
+// of an item that was never added but whose positions collide with
+// items that were — cannot be detected by anything, and it is the one
+// way this structure can be made to report a false negative.
+//
+// ```novo
+// use blcounting
+//
+// fn main() [io]
+//     match blcounting.new(1000, 0.01, "test")
+//         Err(e) => println(e.message())
+//         Ok(f)  =>
+//             match blcounting.remove(f, bytes.from_str("ada"), demo_hash)
+//                 Ok(_)  => println("removed")
+//                 Err(e) => println(e.message())
+//
+// fn demo_hash(b: Bytes) -> Int
+//     bytes.len(b) * 2654435761
+// ```
+pub fn remove(f: BlCountingFilter, item: Bytes,
+              hash: fn(Bytes) -> Int) -> Result<BlCountingFilter, blfault.BlFault>
+    todo("bloom-nv.blcounting.remove")
+
+// Whether the item may be in the filter.
+//
+// `false` is certain, as in the plain filter.
+//
+// ```novo
+// use blcounting
+//
+// fn main() [io]
+//     match blcounting.new(1000, 0.01, "test")
+//         Err(e) => println(e.message())
+//         Ok(f)  => println("${blcounting.contains(f, bytes.from_str("ada"), demo_hash)}")
+//
+// fn demo_hash(b: Bytes) -> Int
+//     bytes.len(b) * 2654435761
+// ```
+pub fn contains(f: BlCountingFilter, item: Bytes, hash: fn(Bytes) -> Int) -> Bool
+    todo("bloom-nv.blcounting.contains")
+
+// The smallest of an item's counters.
+//
+// An upper bound on how many times the item was added — the count-min
+// estimate over four-bit counters — and `0` is the proof that it was
+// never added at all.  Published because it is the number `remove`
+// refuses on, and a caller that wants to know how close a counter is
+// to saturating needs it.
+//
+// ```novo
+// use blcounting
+//
+// fn main() [io]
+//     match blcounting.new(1000, 0.01, "test")
+//         Err(e) => println(e.message())
+//         Ok(f)  => println("${blcounting.min_counter(f, bytes.from_str("ada"), demo_hash)}")
+//
+// fn demo_hash(b: Bytes) -> Int
+//     bytes.len(b) * 2654435761
+// ```
+pub fn min_counter(f: BlCountingFilter, item: Bytes, hash: fn(Bytes) -> Int) -> Int
+    todo("bloom-nv.blcounting.min_counter")
+
+// How many items are currently in the filter: added, less removed.
+//
+// ```novo
+// use blcounting
+//
+// fn main() [io]
+//     match blcounting.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blcounting.present_count(f)}")   // 0
+//         Err(e) => println(e.message())
+// ```
+pub fn present_count(f: BlCountingFilter) -> Int
+    todo("bloom-nv.blcounting.present_count")
+
+// The false-positive rate at the current fill.
+//
+// ```novo
+// use blcounting
+//
+// fn main() [io]
+//     match blcounting.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blcounting.false_positive_rate(f)}")     // 0
+//         Err(e) => println(e.message())
+// ```
+pub fn false_positive_rate(f: BlCountingFilter) -> Float
+    todo("bloom-nv.blcounting.false_positive_rate")
+
+// How many counters each item touches.
+//
+// ```novo
+// use blcounting
+//
+// fn main() [io]
+//     match blcounting.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${blcounting.hash_count(f)}")  // 7
+//         Err(e) => println(e.message())
+// ```
+pub fn hash_count(f: BlCountingFilter) -> Int
+    todo("bloom-nv.blcounting.hash_count")
+
+// The filter as bytes, carrying its shape and hash label.
+//
+// ```novo
+// use blcounting
+//
+// fn main() [io]
+//     match blcounting.new(1000, 0.01, "xxh3")
+//         Ok(f)  => println("${bytes.len(blcounting.to_bytes(f)) > 0}")
+//         Err(e) => println(e.message())
+// ```
+pub fn to_bytes(f: BlCountingFilter) -> Bytes
+    todo("bloom-nv.blcounting.to_bytes")
+
+// A filter read back from bytes.
+//
+// ```novo
+// use blcounting
+//
+// fn main() [io]
+//     match blcounting.from_bytes(bytes.from_str(""))
+//         Ok(f)  => println("${blcounting.present_count(f)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn from_bytes(b: Bytes) -> Result<BlCountingFilter, blfault.BlFault>
+    todo("bloom-nv.blcounting.from_bytes")

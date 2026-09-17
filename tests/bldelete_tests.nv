@@ -1,0 +1,119 @@
+// bldelete_tests.nv — the API suite for the two filters that can
+// forget.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// bloom-nv.blcounting.<fn>` or `…blcuckoo.<fn>`.  What is asserted is
+// that both refuse the operations that would produce a false negative,
+// and that a cuckoo filter's insert can fail and says so.
+
+use std.test
+use blcounting
+use blcuckoo
+use blfault
+
+fn fixed_hash(b: Bytes) -> Int
+    bytes.len(b) * 2654435761
+
+@test
+fn test_a_counting_filter_removes_what_it_added() [io]
+    match blcounting.new(1000, 0.01, "test")
+        Err(e) => test.fail("1000 items at 1% is a filter: ${e.message()}")
+        Ok(f)  =>
+            test.case("an item added is present, and its counters are above zero")
+            match blcounting.add(f, bytes.from_str("ada"), fixed_hash)
+                Err(e) => test.fail("an empty filter takes an item: ${e.message()}")
+                Ok(g)  =>
+                    test.assert(blcounting.contains(g, bytes.from_str("ada"), fixed_hash))
+                    test.assert(blcounting.present_count(g) == 1)
+                    test.assert(blcounting.min_counter(g, bytes.from_str("ada"), fixed_hash) == 1)
+
+                    test.case("removing it puts the filter back where it was")
+                    match blcounting.remove(g, bytes.from_str("ada"), fixed_hash)
+                        Err(e) => test.fail("an item that was added can be removed: ${e.message()}")
+                        Ok(h)  =>
+                            test.assert(blcounting.present_count(h) == 0)
+                            test.assert(blcounting.min_counter(h, bytes.from_str("ada"),
+                                                               fixed_hash) == 0)
+
+                    test.case("adding it twice needs removing it twice")
+                    match blcounting.add(g, bytes.from_str("ada"), fixed_hash)
+                        Err(e) => test.fail("a second add is allowed: ${e.message()}")
+                        Ok(i)  =>
+                            test.assert(blcounting.min_counter(i, bytes.from_str("ada"),
+                                                               fixed_hash) == 2)
+
+@test
+fn test_a_counting_filter_refuses_what_would_make_it_lie() [io]
+    match blcounting.new(1000, 0.01, "test")
+        Err(e) => test.fail("1000 items at 1% is a filter: ${e.message()}")
+        Ok(f)  =>
+            test.case("removing an item whose counters are zero is PROOF it was never added")
+            match blcounting.remove(f, bytes.from_str("never"), fixed_hash)
+                Ok(_)  => test.fail("this would clear bits belonging to other items")
+                Err(e) => test.assert(blfault.code(e) == "remove_of_unknown_item")
+
+            test.case("and that refusal is a mistake in the caller, not a full filter")
+            match blcounting.remove(f, bytes.from_str("never"), fixed_hash)
+                Ok(_)  => test.fail("this would clear bits belonging to other items")
+                Err(e) => test.assert(blfault.is_capacity_fault(e) == false)
+
+            test.case("a saturated counter is refused too, because a wrap is a false negative")
+            test.assert(blfault.is_capacity_fault(BlCounterSaturated(7)))
+
+            test.case("an empty filter has a rate of zero and the plain filter's hash count")
+            test.assert(blcounting.false_positive_rate(f) == 0.0)
+            test.assert(blcounting.hash_count(f) == 7)
+
+            test.case("and it round-trips through bytes")
+            match blcounting.from_bytes(blcounting.to_bytes(f))
+                Err(e) => test.fail("what `to_bytes` wrote reads back: ${e.message()}")
+                Ok(r)  => test.assert(blcounting.present_count(r) == 0)
+
+    match blcounting.from_bytes(bytes.from_str("nope"))
+        Ok(_)  => test.fail("this is not a serialised filter")
+        Err(e) => test.assert(blfault.code(e) == "bad_serialised_form")
+
+@test
+fn test_a_cuckoo_filter_deletes_without_the_counting_filters_memory() [io]
+    match blcuckoo.new(1000, 0.01, "test")
+        Err(e) => test.fail("1000 items at 1% is a filter: ${e.message()}")
+        Ok(f)  =>
+            test.case("an empty filter is empty, and has room for its capacity")
+            test.assert(blcuckoo.stored_count(f) == 0)
+            test.assert(blcuckoo.load_factor(f) == 0.0)
+            test.assert(blcuckoo.capacity_of(f) >= 1000)
+            test.assert(blcuckoo.false_positive_rate(f) <= 0.01)
+
+            test.case("an insert into an empty filter needs no eviction and no randomness")
+            match blcuckoo.add(f, bytes.from_str("ada"), fixed_hash, [])
+                Err(e) => test.fail("an empty filter takes an item: ${e.message()}")
+                Ok(g)  =>
+                    test.assert(blcuckoo.stored_count(g) == 1)
+                    test.assert(blcuckoo.contains(g, bytes.from_str("ada"), fixed_hash))
+                    test.assert(blcuckoo.load_factor(g) > 0.0)
+
+                    test.case("removing it takes the fingerprint out")
+                    match blcuckoo.remove(g, bytes.from_str("ada"), fixed_hash)
+                        Err(e) => test.fail("an item that was added can be removed: ${e.message()}")
+                        Ok(h)  => test.assert(blcuckoo.stored_count(h) == 0)
+
+            test.case("removing an item that is not there is refused")
+            match blcuckoo.remove(f, bytes.from_str("never"), fixed_hash)
+                Ok(_)  => test.fail("neither bucket holds this fingerprint")
+                Err(e) => test.assert(blfault.code(e) == "remove_of_unknown_item")
+
+            test.case("the eviction limit is what an insert may consume in random numbers")
+            test.assert(blcuckoo.uniforms_needed(f) == 500)
+
+            test.case("a full filter refuses the insert — abruptly, which is the price of the space")
+            test.assert(blfault.code(BlCuckooFull(500)) == "cuckoo_full")
+            test.assert(blfault.is_capacity_fault(BlCuckooFull(500)))
+
+            test.case("and a filter round-trips through bytes")
+            match blcuckoo.from_bytes(blcuckoo.to_bytes(f))
+                Err(e) => test.fail("what `to_bytes` wrote reads back: ${e.message()}")
+                Ok(r)  => test.assert(blcuckoo.stored_count(r) == 0)
+
+    match blcuckoo.from_bytes(bytes.from_str("nope"))
+        Ok(_)  => test.fail("this is not a serialised filter")
+        Err(e) => test.assert(blfault.code(e) == "bad_serialised_form")
