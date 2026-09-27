@@ -1,44 +1,38 @@
 // blbloom.nv — the Bloom filter.
 //
-// WHAT IT IS
+// A Bloom filter answers one question, "have I seen this?", in a few
+// bits per item, with a one-sided error.  `false` means the item was
+// never added.  `true` means it probably was: with probability at most
+// the rate the filter was sized for, it is a false positive and the
+// item was never added.  There are no false negatives, so a caller can
+// skip an expensive lookup whenever the filter says `false`.  Burton
+// Bloom's 1970 paper is the original.
 //
-// A Bloom filter answers one question — "have I seen this?" — in a few
-// bits per item, and it answers it with a one-sided error.  `false`
-// means the item was definitely never added.  `true` means it probably
-// was: with probability at most the rate the filter was sized for, it
-// is a FALSE POSITIVE and the item was never added at all.
+// Two numbers fix the filter: how many items are expected, and what
+// false-positive rate is acceptable.  From those the bit count is
+// `-n ln p / (ln 2)^2` and the hash count is `(m / n) ln 2`, which is
+// about ten bits per item for one per cent and fifteen for one per
+// thousand.  `new` does that arithmetic, and `with_bits` is for a
+// caller matching another implementation's parameters.
 //
-// There are no false negatives, ever, and that is what makes the
-// structure useful: a caller can skip the expensive lookup whenever
-// the filter says `false`, and be certain it skipped nothing real.
-// Burton Bloom's 1970 paper is the original.
+// A filter that holds more items than it was sized for goes on working
+// with a higher rate, and nothing is refused.  `false_positive_rate`
+// answers the rate at the current fill, and `is_saturated` says when
+// the fill has passed the capacity.
 //
-// SIZING IS THE WHOLE DECISION
+// The `k` positions of an item come from one 64-bit hash by the
+// construction of Kirsch and Mitzenmacher (2006):
+// `g_i = (h1 + i * h2) mod m` for `i` from `0` to `k - 1`, with `h1`
+// the low 32 bits of the hash and `h2` the high 32 bits, both
+// unsigned.  Bit `g` is bit `g mod 8` of byte `g / 8`, the lowest bit
+// first.
 //
-// Two numbers fix everything: how many items are expected, and what
-// false-positive rate is acceptable.  From those the optimal bit count
-// is `-n ln p / (ln 2)^2` and the optimal hash count is
-// `(m / n) ln 2` — about ten bits per item for one per cent, fifteen
-// for one per thousand.  `new` does that arithmetic, and `with_bits`
-// is for a caller matching another implementation's parameters.
-//
-// PUT MORE IN THAN IT WAS SIZED FOR AND THE RATE CLIMBS
-//
-// Nothing breaks and nothing is refused; the filter just becomes less
-// useful, silently.  `false_positive_rate` answers the rate at the
-// current fill rather than the target, and `is_saturated` is the
-// question a caller should be asking on a schedule.
-//
-// ONE HASH IS ENOUGH
-//
-// The filter needs `k` independent positions per item, and it gets
-// them from one 64-bit hash by the construction of Kirsch and
-// Mitzenmacher (2006): the two halves of the hash are combined as
-// `h1 + i * h2`.  So the caller supplies one `fn(Bytes) -> Int`, and
-// the same hash label rule as everywhere: it is carried, compared on a
-// union, and interpreted nowhere.
+// A filter is changed in place.  `add` writes into the filter it is
+// given, so a caller keeps the filter in a `var` binding, and adding
+// an item costs `k` bit writes whatever the filter's size.
 
 use blfault
+use blshared
 
 // A Bloom filter.
 pub struct BloomFilter
@@ -49,13 +43,18 @@ pub struct BloomFilter
     // The label the caller gave for the hash the filter was fed
     // through.
     hash_id: Str
-    // How many items the filter was sized for.
+    // How many items the filter was sized for.  For a filter built
+    // with `with_bits`, the count for which its sizing is optimal,
+    // `m ln 2 / k`.
     capacity: Int
+    // The false-positive rate the filter was sized for, or `0.0` when
+    // it was built with `with_bits`.
+    target: Float
     // The bits themselves, eight to a byte.
-    bitmap: Bytes
+    var bitmap: Bytes
     // How many items have been added, which is what the current
     // false-positive rate is computed from.
-    inserted: Int
+    var inserted: Int
 
 // An empty filter sized for `capacity` items at a false-positive rate
 // of `target`.
@@ -73,13 +72,18 @@ pub struct BloomFilter
 //         Err(e) => println(e.message())
 // ```
 pub fn new(capacity: Int, target: Float, hash_id: Str) -> Result<BloomFilter, blfault.BlFault>
-    todo("bloom-nv.blbloom.new")
+    match blshared.sizing_fault(capacity, target)
+        Some(fault) => Err(fault)
+        None        =>
+            let width = blshared.optimal_bits(capacity, target)
+            Ok(empty(width, blshared.optimal_hashes(width, capacity), hash_id, capacity, target))
 
 // An empty filter with the bit count and hash count given directly.
 //
 // For a caller matching another implementation's parameters, or one
 // that has a fixed amount of memory and wants to know what rate it
-// buys.  `false_positive_rate` answers that.
+// buys.  `false_positive_rate` answers that.  A bit count or a hash
+// count below one is refused as `BlCapacityNotPositive`, naming it.
 //
 // ```novo
 // use blbloom
@@ -90,13 +94,17 @@ pub fn new(capacity: Int, target: Float, hash_id: Str) -> Result<BloomFilter, bl
 //         Err(e) => println(e.message())
 // ```
 pub fn with_bits(bits: Int, hashes: Int, hash_id: Str) -> Result<BloomFilter, blfault.BlFault>
-    todo("bloom-nv.blbloom.with_bits")
+    if bits < 1
+        return Err(BlCapacityNotPositive(bits))
+    if hashes < 1
+        return Err(BlCapacityNotPositive(hashes))
+    Ok(empty(bits, hashes, hash_id, blshared.natural_capacity(bits, hashes), 0.0))
 
-// The filter with one item added.
+// Adds one item to the filter, in place.
 //
-// Adding an item twice changes nothing: the bits are already set.
-// That is why a Bloom filter cannot count, and why `inserted_count` is
-// what was offered rather than what is distinct.
+// Adding an item twice sets no new bit.  A Bloom filter cannot count,
+// and `inserted_count` is what was offered rather than what is
+// distinct.
 //
 // ```novo
 // use blbloom
@@ -105,27 +113,35 @@ pub fn with_bits(bits: Int, hashes: Int, hash_id: Str) -> Result<BloomFilter, bl
 //     match blbloom.new(1000, 0.01, "test")
 //         Err(e) => println(e.message())
 //         Ok(f)  =>
-//             let one = blbloom.add(f, bytes.from_str("ada"), demo_hash)
-//             println("${blbloom.contains(one, bytes.from_str("ada"), demo_hash)}")
+//             var seen = f
+//             blbloom.add(seen, bytes.from_str("ada"), demo_hash)
+//             println("${blbloom.contains(seen, bytes.from_str("ada"), demo_hash)}")
 //
 // fn demo_hash(b: Bytes) -> Int
 //     bytes.len(b) * 2654435761
 // ```
-pub fn add(f: BloomFilter, item: Bytes, hash: fn(Bytes) -> Int) -> BloomFilter
-    todo("bloom-nv.blbloom.add")
+pub fn add(var f: BloomFilter, item: Bytes, hash: fn(Bytes) -> Int)
+    add_hashed(f, hash(item))
 
-// The filter with one already-hashed item added.
+// Adds one already-hashed item to the filter, in place.
 //
 // ```novo
 // use blbloom
 //
 // fn main() [io]
 //     match blbloom.new(1000, 0.01, "xxh3")
-//         Ok(f)  => println("${blbloom.inserted_count(blbloom.add_hashed(f, 981723))}")
+//         Ok(f)  =>
+//             var seen = f
+//             blbloom.add_hashed(seen, 981723)
+//             println("${blbloom.inserted_count(seen)}")    // 1
 //         Err(e) => println(e.message())
 // ```
-pub fn add_hashed(f: BloomFilter, hashed: Int) -> BloomFilter
-    todo("bloom-nv.blbloom.add_hashed")
+pub fn add_hashed(var f: BloomFilter, hashed: Int)
+    for i in 0..f.hashes
+        let g = blshared.position(hashed, i, f.bits)
+        let byte = bytes.byte_at(f.bitmap, g / 8) ?? 0
+        bytes.set_u8(f.bitmap, g / 8, byte | (1 << (g % 8)))
+    f.inserted = f.inserted + 1
 
 // Whether the item may have been added.
 //
@@ -145,7 +161,7 @@ pub fn add_hashed(f: BloomFilter, hashed: Int) -> BloomFilter
 //     bytes.len(b) * 2654435761
 // ```
 pub fn contains(f: BloomFilter, item: Bytes, hash: fn(Bytes) -> Int) -> Bool
-    todo("bloom-nv.blbloom.contains")
+    contains_hashed(f, hash(item))
 
 // Whether an already-hashed item may have been added.
 //
@@ -158,15 +174,20 @@ pub fn contains(f: BloomFilter, item: Bytes, hash: fn(Bytes) -> Int) -> Bool
 //         Err(e) => println(e.message())
 // ```
 pub fn contains_hashed(f: BloomFilter, hashed: Int) -> Bool
-    todo("bloom-nv.blbloom.contains_hashed")
+    for i in 0..f.hashes
+        let g = blshared.position(hashed, i, f.bits)
+        let byte = bytes.byte_at(f.bitmap, g / 8) ?? 0
+        if (byte & (1 << (g % 8))) == 0
+            return false
+    true
 
 // The false-positive rate at the current fill.
 //
 // `(1 - e^(-k n / m))^k`, with `n` the number of items added.  An
 // empty filter answers `0.0`, a filter at its capacity answers about
 // its target, and a filter past its capacity answers a number that
-// keeps climbing — which is the number a caller should act on rather
-// than the target it was built with.
+// keeps climbing.  That is the number a caller acts on, rather than
+// the target the filter was built with.
 //
 // ```novo
 // use blbloom
@@ -177,7 +198,7 @@ pub fn contains_hashed(f: BloomFilter, hashed: Int) -> Bool
 //         Err(e) => println(e.message())
 // ```
 pub fn false_positive_rate(f: BloomFilter) -> Float
-    todo("bloom-nv.blbloom.false_positive_rate")
+    blshared.rate(f.hashes, f.inserted, f.bits)
 
 // The rate the filter was sized for, or `0.0` when it was built with
 // `with_bits`.
@@ -191,7 +212,7 @@ pub fn false_positive_rate(f: BloomFilter) -> Float
 //         Err(e) => println(e.message())
 // ```
 pub fn target_rate(f: BloomFilter) -> Float
-    todo("bloom-nv.blbloom.target_rate")
+    f.target
 
 // Whether more items have been added than the filter was sized for.
 //
@@ -208,7 +229,7 @@ pub fn target_rate(f: BloomFilter) -> Float
 //         Err(e) => println(e.message())
 // ```
 pub fn is_saturated(f: BloomFilter) -> Bool
-    todo("bloom-nv.blbloom.is_saturated")
+    f.inserted > f.capacity
 
 // How many bits the filter has.
 //
@@ -221,7 +242,7 @@ pub fn is_saturated(f: BloomFilter) -> Bool
 //         Err(e) => println(e.message())
 // ```
 pub fn bit_count(f: BloomFilter) -> Int
-    todo("bloom-nv.blbloom.bit_count")
+    f.bits
 
 // How many positions each item sets.
 //
@@ -234,7 +255,7 @@ pub fn bit_count(f: BloomFilter) -> Int
 //         Err(e) => println(e.message())
 // ```
 pub fn hash_count(f: BloomFilter) -> Int
-    todo("bloom-nv.blbloom.hash_count")
+    f.hashes
 
 // How many items have been added.
 //
@@ -250,13 +271,14 @@ pub fn hash_count(f: BloomFilter) -> Int
 //         Err(e) => println(e.message())
 // ```
 pub fn inserted_count(f: BloomFilter) -> Int
-    todo("bloom-nv.blbloom.inserted_count")
+    f.inserted
 
 // The filter that holds everything both hold.
 //
 // A bitwise OR, and it is exact: the union of two filters is the
-// filter that would have had both streams added to it.  Refused when
-// the shapes or the hash labels differ.
+// filter that would have had both streams added to it.  Its inserted
+// count is the sum of the two.  Refused when the shapes differ, and
+// then when the hash labels differ.  Neither input is changed.
 //
 // ```novo
 // use blbloom
@@ -270,16 +292,18 @@ pub fn inserted_count(f: BloomFilter) -> Int
 //                 Err(e) => println(e.message())
 // ```
 pub fn union(a: BloomFilter, b: BloomFilter) -> Result<BloomFilter, blfault.BlFault>
-    todo("bloom-nv.blbloom.union")
+    match mismatch(a, b)
+        Some(fault) => Err(fault)
+        None        => Ok(combined(a, b, true))
 
-// The filter of the items both hold — a bitwise AND, and NOT exact.
+// The filter of the items both hold: a bitwise AND, which is not
+// exact.
 //
 // The result answers `true` for any item whose bits happen to be set
 // in both filters for different reasons, so its false-positive rate is
-// higher than either input's and is not bounded by the target.  It is
-// here because a caller sometimes needs it anyway, and the number it
-// must not trust is `false_positive_rate`, which is computed from a
-// fill this operation invalidates.
+// higher than either input's and is not bounded by the target.  Its
+// inserted count is the smaller of the two, and `false_positive_rate`
+// computed from it means nothing.  Refused as `union` is.
 //
 // ```novo
 // use blbloom
@@ -293,9 +317,17 @@ pub fn union(a: BloomFilter, b: BloomFilter) -> Result<BloomFilter, blfault.BlFa
 //                 Err(e) => println(e.message())
 // ```
 pub fn intersection(a: BloomFilter, b: BloomFilter) -> Result<BloomFilter, blfault.BlFault>
-    todo("bloom-nv.blbloom.intersection")
+    match mismatch(a, b)
+        Some(fault) => Err(fault)
+        None        => Ok(combined(a, b, false))
 
 // The filter as bytes, carrying its shape and hash label.
+//
+// The layout is this package's own: the four bytes `NVBF`, a version
+// byte `1`, then big-endian the bit count (8 bytes), the hash count
+// (4), the capacity (8), the inserted count (8) and the bits of the
+// target rate as an IEEE 754 double (8), the hash label as a 16-bit
+// length and its bytes, and the bitmap.
 //
 // ```novo
 // use blbloom
@@ -306,9 +338,19 @@ pub fn intersection(a: BloomFilter, b: BloomFilter) -> Result<BloomFilter, blfau
 //         Err(e) => println(e.message())
 // ```
 pub fn to_bytes(f: BloomFilter) -> Bytes
-    todo("bloom-nv.blbloom.to_bytes")
+    let head = blshared.header(MAGIC, [
+        (f.bits, 8),
+        (f.hashes, 4),
+        (f.capacity, 8),
+        (f.inserted, 8),
+        (float.to_bits(f.target), 8)],
+    f.hash_id)
+    bytes.concat([head, f.bitmap])
 
-// A filter read back from bytes.
+// A filter read back from bytes that `to_bytes` wrote.
+//
+// Refused as `BlBadSerialisedForm`, saying why, when the magic, the
+// version, a size or the bitmap's length is wrong.
 //
 // ```novo
 // use blbloom
@@ -319,4 +361,61 @@ pub fn to_bytes(f: BloomFilter) -> Bytes
 //         Err(e) => println(e.message())
 // ```
 pub fn from_bytes(b: Bytes) -> Result<BloomFilter, blfault.BlFault>
-    todo("bloom-nv.blbloom.from_bytes")
+    let (fields, label, from) = blshared.read_header(b, MAGIC, [8, 4, 8, 8, 8])!
+    let width = fields[0]
+    let hashes = fields[1]
+    if width < 1 or hashes < 1 or fields[2] < 1 or fields[3] < 0
+        return Err(BlBadSerialisedForm("a size in the header is out of range"))
+    if let Some(fault) = blshared.payload_fault(b, from, (width + 7) / 8)
+        return Err(fault)
+    Ok(BloomFilter {
+        bits: width,
+        hashes: hashes,
+        hash_id: label,
+        capacity: fields[2],
+        target: float.from_bits(fields[4]),
+        bitmap: bytes.slice(b, from, bytes.len(b)),
+        inserted: fields[3] })
+
+// The four bytes a serialised Bloom filter starts with.
+const MAGIC: Str = "NVBF"
+
+fn empty(bits: Int, hashes: Int, hash_id: Str, capacity: Int, target: Float) -> BloomFilter
+    BloomFilter {
+        bits: bits,
+        hashes: hashes,
+        hash_id: hash_id,
+        capacity: capacity,
+        target: target,
+        bitmap: bytes.zeros((bits + 7) / 8),
+        inserted: 0 }
+
+// Why two filters cannot be combined, or `None`.
+fn mismatch(a: BloomFilter, b: BloomFilter) -> ?blfault.BlFault
+    if a.bits != b.bits or a.hashes != b.hashes
+        return Some(BlShapeMismatch(shape_text(a), shape_text(b)))
+    if a.hash_id != b.hash_id
+        return Some(BlHashMismatch(a.hash_id, b.hash_id))
+    None
+
+fn shape_text(f: BloomFilter) -> Str
+    "${f.bits} bits, ${f.hashes} hashes"
+
+// The bitwise OR of two filters of one shape when `either` is set, and
+// their AND otherwise.
+fn combined(a: BloomFilter, b: BloomFilter, either: Bool) -> BloomFilter
+    var out = empty(a.bits, a.hashes, a.hash_id, a.capacity, a.target)
+    for i in 0..bytes.len(a.bitmap)
+        let x = bytes.byte_at(a.bitmap, i) ?? 0
+        let y = bytes.byte_at(b.bitmap, i) ?? 0
+        if either
+            bytes.set_u8(out.bitmap, i, x | y)
+        else
+            bytes.set_u8(out.bitmap, i, x & y)
+    if either
+        out.inserted = a.inserted + b.inserted
+    else if a.inserted < b.inserted
+        out.inserted = a.inserted
+    else
+        out.inserted = b.inserted
+    out

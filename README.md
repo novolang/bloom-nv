@@ -13,12 +13,6 @@ implementations are the Rust crate
 [bloomfilter](https://docs.rs/bloomfilter) and the Python library
 [pybloom](https://github.com/jaybaird/python-bloomfilter).
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What a membership filter is
 
 A Bloom filter is an array of bits and a number of hash positions. To
@@ -58,7 +52,11 @@ negatives. The two variants here can.
 All three need a 64-bit hash. **That hash is the caller's**, passed in
 as a function. One is enough: the several positions each item needs are
 derived from the two halves of one hash value (Kirsch and
-Mitzenmacher, 2006).
+Mitzenmacher, 2006), as `h1 + i * h2` modulo the bit count.
+
+A filter is changed in place. `add` and `remove` write into the filter
+they are given, so a program keeps a filter in a `var` binding, and an
+add costs a handful of bit writes whatever the filter's size.
 
 ## Install
 
@@ -83,7 +81,9 @@ fn main() [io]
         Ok(empty) =>
             println("${blbloom.bit_count(empty)} bits, ${blbloom.hash_count(empty)} positions")
 
-            let seen = blbloom.add(empty, bytes.from_str("ada"), key_hash)
+            // A filter is changed in place, so it lives in a `var`.
+            var seen = empty
+            blbloom.add(seen, bytes.from_str("ada"), key_hash)
 
             // `false` is certain: skip the expensive lookup.
             if blbloom.contains(seen, bytes.from_str("grace"), key_hash)
@@ -95,11 +95,6 @@ fn main() [io]
             if blbloom.is_saturated(seen)
                 println("rebuild larger: now ${blbloom.false_positive_rate(seen)}")
 ```
-
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: bloom-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
 
 ## What the package contains
 
@@ -120,7 +115,7 @@ below about 3%: it uses less space than a Bloom filter there, and much
 less than a counting one. Its cost is that an insert can be refused.
 
 **Take `blcounting` when removals are frequent and inserts must never
-fail.** It is sixteen times the memory of a plain filter, and it
+fail.** It is four times the memory of a plain filter, and it
 degrades the way a Bloom filter does.
 
 **`add_hashed` and `contains_hashed` are for a caller that already
@@ -160,8 +155,8 @@ hashed the item** for another reason, and should not pay twice.
     removal into a false negative.
 11. **A cuckoo insert can fail.** When both candidate buckets are full
     the filter relocates existing fingerprints, and after five hundred
-    relocations it gives up with `BlCuckooFull`. A filter above about
-    0.95 `load_factor` is full in practice.
+    relocations it gives up with `BlCuckooFull`, putting back what it
+    moved. A filter above about 0.95 `load_factor` is full in practice.
 12. **A cuckoo insert takes the random numbers it may need.** Which
     fingerprint to evict is a random choice, and this package draws
     nothing. `uniforms_needed` says how many are enough.
@@ -173,21 +168,15 @@ hashed the item** for another reason, and should not pay twice.
 14. **Union and intersection need identical shapes and hash labels.**
     `blfault.is_capacity_fault` separates "the filter is full" from
     "this call is wrong".
-
-## Running on a microcontroller
-
-Every module in this package builds for a microcontroller: no function
-performs any input or output, reads a clock or draws a random number. A
-device deciding whether it has already seen a packet identifier sizes a
-filter once and keeps it in a fixed byte array.
-
-Memory is exactly the sizing: one bit per position for `blbloom`, four
-for `blcounting`, and `fingerprint_bits` per slot for `blcuckoo`. The
-rate arithmetic uses `Float`; the filters themselves are integer
-operations over bytes.
+15. **A refused add or remove changes nothing.** A counting filter
+    checks every counter before it writes one, and a cuckoo filter
+    undoes its relocations.
 
 ## What is not included
 
+- **A build for a microcontroller.** No function performs input or
+  output, reads a clock or draws a random number, but the filters hold
+  `Bytes` and a label `Str`, and a device build admits neither.
 - **A hash function.** See rule 2. A caller that already has one should
   not get a second, and pinning one here would pin every consumer.
 - **A random number generator.** See rule 12.
@@ -219,7 +208,11 @@ operations over bytes.
 
 ```bash
 novo test tests/blbloom_tests.nv     # the one-sided error, the sizing, union and intersection
-novo test tests/bldelete_tests.nv    # the two filters that forget, and their refusals
+novo test tests/bldelete_tests.nv    # the two filters that remove, and their refusals
+novo test tests/blfault_tests.nv     # the codes and the messages
+novo test tests/layout_tests.nv      # positions and bytes worked out by hand
+novo test tests/rate_tests.nv        # the false-positive rate, measured
+bash tests/coverage.sh               # line coverage over src/
 ```
 
 The normative sources are Bloom's 1970 paper for the filter and its
@@ -234,26 +227,13 @@ that removing an item whose counters are zero is refused, and that a
 cuckoo filter's `BlCuckooFull` is a capacity fault rather than a
 mistake in the caller.
 
-The tests compile today and fail at run, each on the
-`not implemented: bloom-nv.<module>.<fn>` panic that is its body. That
-is the expected state of an interface release. They turn green one at a
-time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `blfault.BlFault`, `blbloom.BloomFilter`, `blcounting.BlCountingFilter`, `blcuckoo.BlCuckooFilter` | the types are declared |
-| `blfault.code`, `.is_capacity_fault`, `BlFault.message` | no |
-| `blbloom.new`, `.with_bits`, `.add`, `.add_hashed`, `.contains`, `.contains_hashed` | no |
-| `blbloom.false_positive_rate`, `.target_rate`, `.is_saturated` | no |
-| `blbloom.bit_count`, `.hash_count`, `.inserted_count` | no |
-| `blbloom.union`, `.intersection`, `.to_bytes`, `.from_bytes` | no |
-| `blcounting.new`, `.add`, `.remove`, `.contains`, `.min_counter` | no |
-| `blcounting.present_count`, `.false_positive_rate`, `.hash_count`, `.to_bytes`, `.from_bytes` | no |
-| `blcuckoo.new`, `.add`, `.contains`, `.remove`, `.uniforms_needed` | no |
-| `blcuckoo.stored_count`, `.capacity_of`, `.load_factor`, `.false_positive_rate` | no |
-| `blcuckoo.to_bytes`, `.from_bytes` | no |
+`tests/layout_tests.nv` checks the bits, counters and fingerprint
+slots one item sets against values worked out by hand from the
+position formula, the refusals at a full counter and a full pair of
+buckets, and that a refused insert leaves the bytes unchanged.
+`tests/rate_tests.nv` fills each filter with seeded keys, asks about
+20000 keys that were never added, and compares the share of `true`
+answers with the rate each filter reports.
 
 ## Licence
 

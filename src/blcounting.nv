@@ -1,37 +1,30 @@
-// blcounting.nv — the counting Bloom filter, which can forget.
-//
-// WHAT IT ADDS
+// blcounting.nv — the counting Bloom filter, which can remove.
 //
 // A plain Bloom filter cannot remove an item: clearing its bits would
 // clear bits that other items set, and the filter would start
-// answering `false` for things it holds — a false NEGATIVE, which is
-// the one answer these structures promise never to give.
+// answering `false` for things it holds.  That is a false negative,
+// the one answer these structures never give.
 //
-// A counting filter replaces each bit with a small counter.  Adding
-// increments, removing decrements, and a position is "set" while its
-// counter is above zero.  Removal becomes safe, and the price is the
-// counter width: four bits each here, so sixteen times the memory of
-// the plain filter's one bit.
+// A counting filter replaces each bit with a four-bit counter.  Adding
+// increments the item's counters, removing decrements them, and a
+// position is set while its counter is above zero.  The sizing and the
+// positions are the plain filter's, and the memory is four times as
+// much.
 //
-// TWO WAYS TO BREAK IT, AND BOTH ARE REFUSED
+// Two operations would break the filter, and both are refused.  A
+// counter at fifteen cannot be incremented without wrapping to zero,
+// so an add that would overflow one is refused.  A remove of an item
+// whose counters include a zero is proof the item was never added, so
+// that remove is refused too.  A remove of an item that was never added
+// but whose counters are all above zero, because other items share
+// them, cannot be detected, and it is the one way to make this filter
+// report a false negative.
 //
-// A counter that reaches its maximum cannot be incremented again
-// without wrapping to zero, and a wrapped counter makes a later
-// `remove` clear a position that other items need.  So an `add` that
-// would overflow is refused.
-//
-// Removing an item that was never added decrements counters that
-// belong to other items, with the same result.  A filter cannot tell
-// whether an item was truly added — that is what a probabilistic
-// structure means — but it CAN tell that at least one of the item's
-// counters is zero, and that is a certain proof it was never added.
-// `remove` refuses on that proof.
-//
-// The residual risk is a remove of an item that was never added but
-// collides with ones that were.  Nothing can detect that, and the
-// README says so.
+// Counter `j` is the low four bits of byte `j / 2` when `j` is even and
+// the high four bits when it is odd.  A filter is changed in place.
 
 use blfault
+use blshared
 
 // A counting Bloom filter, with four-bit counters.
 pub struct BlCountingFilter
@@ -44,15 +37,15 @@ pub struct BlCountingFilter
     // How many items the filter was sized for.
     capacity: Int
     // The counters, two to a byte.
-    counters: Bytes
+    var counters: Bytes
     // How many items are currently in the filter: added, less
     // removed.
-    present: Int
+    var present: Int
 
 // An empty counting filter sized for `capacity` items at a rate of
 // `target`.
 //
-// The sizing is the plain filter's; the memory is sixteen times as
+// The sizing is the plain filter's, and the memory is four times as
 // much, because each bit becomes a four-bit counter.
 //
 // ```novo
@@ -64,13 +57,23 @@ pub struct BlCountingFilter
 //         Err(e) => println(e.message())
 // ```
 pub fn new(capacity: Int, target: Float, hash_id: Str) -> Result<BlCountingFilter, blfault.BlFault>
-    todo("bloom-nv.blcounting.new")
+    match blshared.sizing_fault(capacity, target)
+        Some(fault) => Err(fault)
+        None        =>
+            let slots = blshared.optimal_bits(capacity, target)
+            Ok(BlCountingFilter {
+                slots: slots,
+                hashes: blshared.optimal_hashes(slots, capacity),
+                hash_id: hash_id,
+                capacity: capacity,
+                counters: bytes.zeros((slots + 1) / 2),
+                present: 0 })
 
-// The filter with one item added.
+// Adds one item to the filter, in place.
 //
-// Refused when one of the item's counters is already at fifteen: the
-// next increment would wrap, and a wrapped counter turns a later
-// `remove` into a false negative.
+// Refused, with nothing changed, when one of the item's counters would
+// pass fifteen: the increment would wrap, and a wrapped counter turns
+// a later `remove` into a false negative.
 //
 // ```novo
 // use blcounting
@@ -79,24 +82,34 @@ pub fn new(capacity: Int, target: Float, hash_id: Str) -> Result<BlCountingFilte
 //     match blcounting.new(1000, 0.01, "test")
 //         Err(e) => println(e.message())
 //         Ok(f)  =>
-//             match blcounting.add(f, bytes.from_str("ada"), demo_hash)
-//                 Ok(g)  => println("${blcounting.present_count(g)}")   // 1
+//             var seen = f
+//             match blcounting.add(seen, bytes.from_str("ada"), demo_hash)
+//                 Ok(_)  => println("${blcounting.present_count(seen)}")   // 1
 //                 Err(e) => println(e.message())
 //
 // fn demo_hash(b: Bytes) -> Int
 //     bytes.len(b) * 2654435761
 // ```
-pub fn add(f: BlCountingFilter, item: Bytes,
-           hash: fn(Bytes) -> Int) -> Result<BlCountingFilter, blfault.BlFault>
-    todo("bloom-nv.blcounting.add")
+pub fn add(var f: BlCountingFilter, item: Bytes,
+           hash: fn(Bytes) -> Int) -> Result<Unit, blfault.BlFault>
+    let hashed = hash(item)
+    for i in 0..f.hashes
+        let j = blshared.position(hashed, i, f.slots)
+        if counter(f, j) + blshared.repeats(hashed, f.hashes, f.slots, j) > LARGEST
+            return Err(BlCounterSaturated(j))
+    for i in 0..f.hashes
+        let j = blshared.position(hashed, i, f.slots)
+        set_counter(f, j, counter(f, j) + 1)
+    f.present = f.present + 1
+    Ok(())
 
-// The filter with one item removed.
+// Removes one item from the filter, in place.
 //
-// Refused when any of the item's counters is zero, which is certain
-// proof the item was never added.  A remove that got through anyway —
-// of an item that was never added but whose positions collide with
-// items that were — cannot be detected by anything, and it is the one
-// way this structure can be made to report a false negative.
+// Refused, with nothing changed, when any of the item's counters is
+// zero, which is proof the item was never added.  A remove of an item
+// that was never added but whose positions collide with items that
+// were cannot be detected, and it is the one way this filter can be
+// made to report a false negative.
 //
 // ```novo
 // use blcounting
@@ -105,16 +118,26 @@ pub fn add(f: BlCountingFilter, item: Bytes,
 //     match blcounting.new(1000, 0.01, "test")
 //         Err(e) => println(e.message())
 //         Ok(f)  =>
-//             match blcounting.remove(f, bytes.from_str("ada"), demo_hash)
+//             var seen = f
+//             match blcounting.remove(seen, bytes.from_str("ada"), demo_hash)
 //                 Ok(_)  => println("removed")
 //                 Err(e) => println(e.message())
 //
 // fn demo_hash(b: Bytes) -> Int
 //     bytes.len(b) * 2654435761
 // ```
-pub fn remove(f: BlCountingFilter, item: Bytes,
-              hash: fn(Bytes) -> Int) -> Result<BlCountingFilter, blfault.BlFault>
-    todo("bloom-nv.blcounting.remove")
+pub fn remove(var f: BlCountingFilter, item: Bytes,
+              hash: fn(Bytes) -> Int) -> Result<Unit, blfault.BlFault>
+    let hashed = hash(item)
+    for i in 0..f.hashes
+        let j = blshared.position(hashed, i, f.slots)
+        if counter(f, j) < blshared.repeats(hashed, f.hashes, f.slots, j)
+            return Err(BlRemoveOfUnknownItem)
+    for i in 0..f.hashes
+        let j = blshared.position(hashed, i, f.slots)
+        set_counter(f, j, counter(f, j) - 1)
+    f.present = f.present - 1
+    Ok(())
 
 // Whether the item may be in the filter.
 //
@@ -132,15 +155,14 @@ pub fn remove(f: BlCountingFilter, item: Bytes,
 //     bytes.len(b) * 2654435761
 // ```
 pub fn contains(f: BlCountingFilter, item: Bytes, hash: fn(Bytes) -> Int) -> Bool
-    todo("bloom-nv.blcounting.contains")
+    min_counter(f, item, hash) > 0
 
 // The smallest of an item's counters.
 //
-// An upper bound on how many times the item was added — the count-min
-// estimate over four-bit counters — and `0` is the proof that it was
-// never added at all.  Published because it is the number `remove`
-// refuses on, and a caller that wants to know how close a counter is
-// to saturating needs it.
+// An upper bound on how many times the item was added, which is the
+// count-min estimate over four-bit counters, and `0` is the proof that
+// it was never added.  It is the number `remove` refuses on, and it
+// tells a caller how close a counter is to saturating.
 //
 // ```novo
 // use blcounting
@@ -154,7 +176,13 @@ pub fn contains(f: BlCountingFilter, item: Bytes, hash: fn(Bytes) -> Int) -> Boo
 //     bytes.len(b) * 2654435761
 // ```
 pub fn min_counter(f: BlCountingFilter, item: Bytes, hash: fn(Bytes) -> Int) -> Int
-    todo("bloom-nv.blcounting.min_counter")
+    let hashed = hash(item)
+    var least = LARGEST
+    for i in 0..f.hashes
+        let c = counter(f, blshared.position(hashed, i, f.slots))
+        if c < least
+            least = c
+    least
 
 // How many items are currently in the filter: added, less removed.
 //
@@ -167,7 +195,7 @@ pub fn min_counter(f: BlCountingFilter, item: Bytes, hash: fn(Bytes) -> Int) -> 
 //         Err(e) => println(e.message())
 // ```
 pub fn present_count(f: BlCountingFilter) -> Int
-    todo("bloom-nv.blcounting.present_count")
+    f.present
 
 // The false-positive rate at the current fill.
 //
@@ -180,7 +208,7 @@ pub fn present_count(f: BlCountingFilter) -> Int
 //         Err(e) => println(e.message())
 // ```
 pub fn false_positive_rate(f: BlCountingFilter) -> Float
-    todo("bloom-nv.blcounting.false_positive_rate")
+    blshared.rate(f.hashes, f.present, f.slots)
 
 // How many counters each item touches.
 //
@@ -193,9 +221,14 @@ pub fn false_positive_rate(f: BlCountingFilter) -> Float
 //         Err(e) => println(e.message())
 // ```
 pub fn hash_count(f: BlCountingFilter) -> Int
-    todo("bloom-nv.blcounting.hash_count")
+    f.hashes
 
 // The filter as bytes, carrying its shape and hash label.
+//
+// The layout is this package's own: the four bytes `NVCB`, a version
+// byte `1`, then big-endian the counter count (8 bytes), the hash
+// count (4), the capacity (8) and the present count (8), the hash
+// label as a 16-bit length and its bytes, and the counters.
 //
 // ```novo
 // use blcounting
@@ -206,9 +239,13 @@ pub fn hash_count(f: BlCountingFilter) -> Int
 //         Err(e) => println(e.message())
 // ```
 pub fn to_bytes(f: BlCountingFilter) -> Bytes
-    todo("bloom-nv.blcounting.to_bytes")
+    let head = blshared.header(MAGIC, [(f.slots, 8), (f.hashes, 4), (f.capacity, 8), (f.present, 8)], f.hash_id)
+    bytes.concat([head, f.counters])
 
-// A filter read back from bytes.
+// A filter read back from bytes that `to_bytes` wrote.
+//
+// Refused as `BlBadSerialisedForm`, saying why, when the magic, the
+// version, a size or the length of the counters is wrong.
 //
 // ```novo
 // use blcounting
@@ -219,4 +256,37 @@ pub fn to_bytes(f: BlCountingFilter) -> Bytes
 //         Err(e) => println(e.message())
 // ```
 pub fn from_bytes(b: Bytes) -> Result<BlCountingFilter, blfault.BlFault>
-    todo("bloom-nv.blcounting.from_bytes")
+    let (fields, label, from) = blshared.read_header(b, MAGIC, [8, 4, 8, 8])!
+    let slots = fields[0]
+    if slots < 1 or fields[1] < 1 or fields[2] < 1 or fields[3] < 0
+        return Err(BlBadSerialisedForm("a size in the header is out of range"))
+    if let Some(fault) = blshared.payload_fault(b, from, (slots + 1) / 2)
+        return Err(fault)
+    Ok(BlCountingFilter {
+        slots: slots,
+        hashes: fields[1],
+        hash_id: label,
+        capacity: fields[2],
+        counters: bytes.slice(b, from, bytes.len(b)),
+        present: fields[3] })
+
+// The four bytes a serialised counting filter starts with.
+const MAGIC: Str = "NVCB"
+
+// The most a four-bit counter holds.
+const LARGEST: Int = 15
+
+// Counter `j`: the low four bits of byte `j / 2` for an even `j`, the
+// high four bits for an odd one.
+fn counter(f: BlCountingFilter, j: Int) -> Int
+    let byte = bytes.byte_at(f.counters, j / 2) ?? 0
+    if j % 2 == 0
+        return byte & 0x0F
+    byte >> 4
+
+fn set_counter(var f: BlCountingFilter, j: Int, value: Int)
+    let byte = bytes.byte_at(f.counters, j / 2) ?? 0
+    if j % 2 == 0
+        bytes.set_u8(f.counters, j / 2, (byte & 0xF0) | value)
+    else
+        bytes.set_u8(f.counters, j / 2, (byte & 0x0F) | (value << 4))

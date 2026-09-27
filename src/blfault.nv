@@ -1,19 +1,14 @@
-// blfault.nv — the ways a filter can be refused.
+// blfault.nv — the ways a filter or an operation can be refused.
 //
-// A FILTER THAT IS FULL IS NOT A FILTER
+// Every filter here is sized for a number of items and a false-positive
+// rate, and each stops honouring that rate once more items go in than
+// it was sized for.  A Bloom filter degrades gradually: the rate
+// climbs.  A cuckoo filter fails at once: an insert is refused.
 //
-// Every structure here is sized for a number of items and a
-// false-positive rate, and every one of them stops honouring that rate
-// once more items go in than it was sized for.  A Bloom filter does it
-// gracefully — the rate climbs — and a cuckoo filter does it abruptly:
-// an insert fails.  Neither is a detail to hide.
-//
-// So `add` on a cuckoo filter answers a `Result`, `is_saturated` is a
-// question every filter answers, and a counting filter whose counter
-// would overflow says so rather than wrapping — a wrapped counter
-// turns a `remove` into a corrupted filter that reports false
-// negatives, which is the one thing these structures promise never to
-// do.
+// A counting filter whose counter would overflow refuses the insert
+// rather than wrapping.  A wrapped counter lets a later `remove` clear
+// a position other items need, and the filter would then report false
+// negatives, which is the one answer these structures never give.
 
 // Why a filter or an operation was refused.
 //
@@ -39,10 +34,10 @@ pub enum BlFault
     // another insert would wrap and make a later `remove` produce a
     // false negative.
     BlCounterSaturated(index: Int)
-    // A `remove` named an item the filter was never told about.
-    // Removing it would clear bits that belong to items that WERE
-    // added, and the filter would start answering `false` for things
-    // it holds.
+    // A `remove` named an item the filter can prove it was never
+    // given.  Removing it would clear state that belongs to items that
+    // were added, and the filter would start answering `false` for
+    // things it holds.
     BlRemoveOfUnknownItem
     // Two filters have different sizes or different hash counts, so
     // their bits do not line up and no union of them means anything.
@@ -54,18 +49,25 @@ pub enum BlFault
     // A serialised filter could not be read.
     BlBadSerialisedForm(why: Str)
 
-// `BlFault` is an `Error`, which is what lets `Result<T, BlFault>`
-// exist at all.
+// `BlFault` is an `Error`, so it can stand in `Result<T, BlFault>`.
 impl Error for BlFault
     // The one-line message, naming what was given and what was
     // required.
-    //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("bloom-nv.BlFault.message")
+        match self
+            BlCapacityNotPositive(n)  => "the capacity is ${n} and must be above zero"
+            BlTargetOutOfRange(t)     => "the target rate is ${t} and must be above 0 and below 1"
+            BlCuckooFull(kicks)       => "the cuckoo filter is full: no place found after ${kicks} relocations"
+            BlCounterSaturated(index) => "counter ${index} is at 15 and one more add would wrap it"
+            BlRemoveOfUnknownItem     => "the item was never added, so it cannot be removed"
+            BlShapeMismatch(l, r)     => "the filters differ in shape: ${l} against ${r}"
+            BlHashMismatch(l, r)      => "the filters were fed different hashes: ${l} against ${r}"
+            BlBadSerialisedForm(why)  => "not a serialised filter: ${why}"
 
-// A short stable code for a log: `"cuckoo_full"`, `"hash_mismatch"`,
-// and so on.
+// A short stable code for a log: `"capacity_not_positive"`,
+// `"target_out_of_range"`, `"cuckoo_full"`, `"counter_saturated"`,
+// `"remove_of_unknown_item"`, `"shape_mismatch"`, `"hash_mismatch"` and
+// `"bad_serialised_form"`.
 //
 // ```novo
 // use blfault
@@ -74,14 +76,22 @@ impl Error for BlFault
 //     println(blfault.code(BlCuckooFull(500)))
 // ```
 pub fn code(f: BlFault) -> Str
-    todo("bloom-nv.blfault.code")
+    match f
+        BlCapacityNotPositive(_) => "capacity_not_positive"
+        BlTargetOutOfRange(_)    => "target_out_of_range"
+        BlCuckooFull(_)          => "cuckoo_full"
+        BlCounterSaturated(_)    => "counter_saturated"
+        BlRemoveOfUnknownItem    => "remove_of_unknown_item"
+        BlShapeMismatch(_, _)    => "shape_mismatch"
+        BlHashMismatch(_, _)     => "hash_mismatch"
+        BlBadSerialisedForm(_)   => "bad_serialised_form"
 
 // Whether the fault means the filter is full rather than that the call
 // was wrong.
 //
 // True for `BlCuckooFull` and `BlCounterSaturated`.  A caller counts
-// these separately and rebuilds at a larger size; the others are
-// mistakes in its own code.
+// these separately and rebuilds at a larger size.  The others are
+// mistakes in the calling code.
 //
 // ```novo
 // use blfault
@@ -90,4 +100,7 @@ pub fn code(f: BlFault) -> Str
 //     println("${blfault.is_capacity_fault(BlCuckooFull(500))}")    // true
 // ```
 pub fn is_capacity_fault(f: BlFault) -> Bool
-    todo("bloom-nv.blfault.is_capacity_fault")
+    match f
+        BlCuckooFull(_)       => true
+        BlCounterSaturated(_) => true
+        _                     => false

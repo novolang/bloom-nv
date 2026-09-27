@@ -1,0 +1,48 @@
+// blfault_tests.nv — every fault has a stable code, a message that
+// names what was given, and a verdict on whether the filter is full.
+
+use std.test
+use blfault
+
+@test
+fn test_every_fault_has_a_code_and_a_message() [io]
+    let faults = [
+        BlCapacityNotPositive(0),
+        BlTargetOutOfRange(1.5),
+        BlCuckooFull(500),
+        BlCounterSaturated(7),
+        BlRemoveOfUnknownItem,
+        BlShapeMismatch("9586 bits, 7 hashes", "4096 bits, 7 hashes"),
+        BlHashMismatch("xxh3", "sha256"),
+        BlBadSerialisedForm("the version is not 1")]
+    let codes = [
+        "capacity_not_positive",
+        "target_out_of_range",
+        "cuckoo_full",
+        "counter_saturated",
+        "remove_of_unknown_item",
+        "shape_mismatch",
+        "hash_mismatch",
+        "bad_serialised_form"]
+    test.case("the codes, in declaration order")
+    for i in 0..list.len(faults)
+        test.assert(blfault.code(faults[i]) == codes[i])
+
+    test.case("two of them mean the filter is full")
+    var full = 0
+    for f in faults
+        if blfault.is_capacity_fault(f)
+            full = full + 1
+    test.assert(full == 2)
+
+@test
+fn test_each_message_names_what_was_given() [io]
+    test.case("the number or the text each arm carries is in its message")
+    test.assert(str.contains(BlCapacityNotPositive(0).message(), "0"))
+    test.assert(str.contains(BlTargetOutOfRange(1.5).message(), "1.5"))
+    test.assert(str.contains(BlCuckooFull(500).message(), "500"))
+    test.assert(str.contains(BlCounterSaturated(7).message(), "7"))
+    test.assert(str.contains(BlRemoveOfUnknownItem.message(), "never added"))
+    test.assert(str.contains(BlShapeMismatch("a", "b").message(), "a against b"))
+    test.assert(str.contains(BlHashMismatch("xxh3", "sha256").message(), "sha256"))
+    test.assert(str.contains(BlBadSerialisedForm("why").message(), "why"))

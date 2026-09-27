@@ -1,0 +1,132 @@
+// blshared.nv — the arithmetic and the byte layout the three filters
+// share.  Nothing here is public.
+//
+// Sizing follows Bloom (1970) as the literature states it: for `n`
+// items at a false-positive rate `p`, the bit count is
+// `m = -n ln p / (ln 2)^2`, rounded up, and the hash count is
+// `k = (m / n) ln 2`, rounded to the nearest integer and at least one.
+//
+// The `k` positions of an item come from one 64-bit hash by the
+// construction of Kirsch and Mitzenmacher (2006):
+// `g_i = (h1 + i * h2) mod m` for `i` from `0` to `k - 1`, where `h1`
+// is the low 32 bits of the hash and `h2` the high 32 bits, both read
+// as unsigned.
+//
+// A serialised filter starts with four magic bytes and a version byte,
+// and every integer after them is big-endian.  The hash label is a
+// 16-bit length and that many bytes.
+
+use blfault
+
+// The version byte every serialised filter carries.
+const VERSION: Int = 1
+
+// The fault for a capacity or a target rate no filter can be sized
+// from, or `None`.
+fn sizing_fault(capacity: Int, target: Float) -> ?blfault.BlFault
+    if capacity <= 0
+        return Some(BlCapacityNotPositive(capacity))
+    if target <= 0.0 or target >= 1.0
+        return Some(BlTargetOutOfRange(target))
+    None
+
+// `-n ln p / (ln 2)^2`, rounded up.
+fn optimal_bits(capacity: Int, target: Float) -> Int
+    let ln2 = math.log(2.0)
+    let exact = 0.0 - int.to_float(capacity) * math.log(target) / (ln2 * ln2)
+    float.to_int(math.ceil(exact))
+
+// `(m / n) ln 2`, rounded to the nearest integer and at least one.
+fn optimal_hashes(bits: Int, capacity: Int) -> Int
+    let k = float.to_int(math.round(int.to_float(bits) / int.to_float(capacity) * math.log(2.0)))
+    if k < 1
+        return 1
+    k
+
+// The item count at which `bits` and `hashes` are the optimal sizing:
+// `m ln 2 / k`, rounded down and at least one.
+fn natural_capacity(bits: Int, hashes: Int) -> Int
+    let n = float.to_int(int.to_float(bits) * math.log(2.0) / int.to_float(hashes))
+    if n < 1
+        return 1
+    n
+
+// `(1 - e^(-k n / m))^k`: the false-positive rate of `m` positions,
+// `k` of them per item, after `n` items.
+fn rate(hashes: Int, items: Int, bits: Int) -> Float
+    if items <= 0
+        return 0.0
+    let k = int.to_float(hashes)
+    let fill = 1.0 - math.exp(0.0 - k * int.to_float(items) / int.to_float(bits))
+    math.pow(fill, k)
+
+// The low 32 bits of a hash, read as unsigned.
+fn low_half(hashed: Int) -> Int
+    hashed & 0xFFFFFFFF
+
+// The high 32 bits of a hash, read as unsigned.
+fn high_half(hashed: Int) -> Int
+    (hashed >>> 32) & 0xFFFFFFFF
+
+// Position `i` of an item among `m`: `(h1 + i * h2) mod m`.
+fn position(hashed: Int, i: Int, m: Int) -> Int
+    (low_half(hashed) + i * high_half(hashed)) % m
+
+// How many of the `k` positions of an item are `p`.  A position can
+// repeat when `h2` is a multiple of `m`.
+fn repeats(hashed: Int, k: Int, m: Int, p: Int) -> Int
+    var count = 0
+    for i in 0..k
+        if position(hashed, i, m) == p
+            count = count + 1
+    count
+
+// A serialised header: the magic, the version, then each field at its
+// width in bytes, which is 1, 4 or 8.
+fn header(magic: Str, fields: [(Int, Int)], label: Str) -> Bytes
+    var parts = [bytes.from_str(magic), bytes.u8(VERSION)]
+    for (value, width) in fields
+        list.push(parts, sized(value, width))
+    list.push(parts, bytes.u16_be(str.len(label)))
+    list.push(parts, bytes.from_str(label))
+    bytes.concat(parts)
+
+fn sized(value: Int, width: Int) -> Bytes
+    match width
+        1 => bytes.u8(value)
+        4 => bytes.u32_be(value)
+        _ => bytes.u64_be(value)
+
+// A serialised header read back: the fields at the widths given, the
+// label, and the offset of the payload after it.  Refused when the
+// magic, the version or the length is wrong.
+fn read_header(b: Bytes, magic: Str, widths: [Int]) -> Result<([Int], Str, Int), blfault.BlFault>
+    let n = bytes.len(b)
+    if n < 5 or bytes.to_str(bytes.slice(b, 0, 4)) != magic
+        return Err(BlBadSerialisedForm("the first four bytes are not ${magic}"))
+    if bytes.byte_at(b, 4) != Some(VERSION)
+        return Err(BlBadSerialisedForm("the version is not ${VERSION}"))
+    var off = 5
+    var values: [Int] = []
+    for width in widths
+        list.push(values, read_sized(b, off, width) ?? 0 - 1)
+        off = off + width
+    let label_len = bytes.u16_be_at(b, off) ?? 0 - 1
+    if label_len < 0 or off + 2 + label_len > n
+        return Err(BlBadSerialisedForm("the header ends early"))
+    let label = bytes.to_str(bytes.slice(b, off + 2, off + 2 + label_len))
+    Ok((values, label, off + 2 + label_len))
+
+fn read_sized(b: Bytes, off: Int, width: Int) -> ?Int
+    match width
+        1 => bytes.byte_at(b, off)
+        4 => bytes.u32_be_at(b, off)
+        _ => bytes.u64_be_at(b, off)
+
+// Why the payload after a header is not exactly `expected` bytes long,
+// or `None`.
+fn payload_fault(b: Bytes, from: Int, expected: Int) -> ?blfault.BlFault
+    let found = bytes.len(b) - from
+    if found != expected
+        return Some(BlBadSerialisedForm("the payload is ${found} bytes, not ${expected}"))
+    None

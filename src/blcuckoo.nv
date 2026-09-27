@@ -1,45 +1,41 @@
 // blcuckoo.nv — the cuckoo filter.
 //
-// WHAT IT IS
-//
 // A cuckoo filter answers the same question a Bloom filter does, and
-// it can delete without the sixteen-fold cost of a counting filter.
-// Fan, Andersen, Kaminsky and Mitzenmacher published it in 2014, and
-// at false-positive rates below about 3% it uses LESS space than a
-// Bloom filter for the same rate.
+// it can remove an item without the counting filter's memory.  Fan,
+// Andersen, Kaminsky and Mitzenmacher published it in 2014.  At
+// false-positive rates below about 3% it uses less space than a Bloom
+// filter for the same rate.
 //
-// It stores a short FINGERPRINT of each item — a few bits of its hash
-// — in one of two buckets.  The two candidate buckets are `i` and
-// `i XOR hash(fingerprint)`, which is the trick that makes the
-// structure work: from an entry alone, without the item, the other
-// bucket it could live in can be computed.
+// It stores a short fingerprint of each item, a few bits of its hash,
+// in one of two buckets.  From the 64-bit hash, as the authors'
+// reference implementation does, the fingerprint is the low
+// `fingerprint_bits` bits, with zero read as one, and the first bucket
+// is the high 32 bits modulo the bucket count.  The second bucket is
+// `i XOR (fingerprint * 0x5bd1e995)` modulo the bucket count.  The
+// same formula leads from either bucket to the other, so an entry can
+// be moved without the item it came from.
 //
-// INSERTING CAN FAIL, AND IT SAYS SO
+// When both buckets are full, the filter evicts a fingerprint from the
+// second bucket, moves it to its own other bucket, and repeats.  After
+// five hundred relocations it gives up, undoes the moves it made, and
+// the insert is refused.  A Bloom filter degrades gradually, and a
+// cuckoo filter fails at once, which is why `add` answers a `Result`.
 //
-// When both buckets are full, the filter evicts an existing
-// fingerprint, moves it to its own alternate bucket, and repeats.
-// After a limit — five hundred relocations — it gives up, and the
-// insert is refused.  That is the price of the space: a Bloom filter
-// degrades gracefully and a cuckoo filter fails abruptly.  `add`
-// answers a `Result` for that reason.
+// Which entry to evict is a random choice, and this package draws no
+// random numbers.  `add` takes the uniforms it may need, and
+// `uniforms_needed` says how many are enough.  Each relocation
+// consumes one, and entry `floor(u * entries_per_bucket)` is evicted.
 //
-// THE EVICTIONS NEED RANDOMNESS, AND IT COMES FROM THE CALLER
+// Removing takes out one matching fingerprint.  An item added twice
+// must be removed twice.  Removing an item that was never added may
+// take out a colliding fingerprint that belonged to a real item, so a
+// caller removes only items it knows it added.
 //
-// Which entry to evict is a random choice.  This package draws no
-// random numbers, so `add` takes the uniforms it may need, as
-// `backoff-nv` and `skreservoir` do.  A caller that wants a
-// deterministic build hands in a fixed list; `uniforms_needed` says
-// how many are enough.
-//
-// DELETING IS SAFE, WITH ONE RULE
-//
-// Deleting removes one matching fingerprint.  An item added twice must
-// be deleted twice, and deleting an item that was never added may
-// remove a colliding fingerprint that belonged to a real item — so a
-// caller must only delete items it knows it added.  That rule is the
-// same one a counting filter has, and it cannot be checked here.
+// A fingerprint is stored in the fewest whole bytes that hold it: one,
+// two or four.  A filter is changed in place.
 
 use blfault
+use blshared
 
 // A cuckoo filter.
 pub struct BlCuckooFilter
@@ -55,18 +51,20 @@ pub struct BlCuckooFilter
     fingerprint_bits: Int
     // The label the caller gave for the hash.
     hash_id: Str
-    // The fingerprints, bucket by bucket.  A zero means an empty slot,
-    // which is why a fingerprint of zero is mapped to one.
-    entries: Bytes
+    // The fingerprints, bucket by bucket, each big-endian in the
+    // fewest whole bytes that hold it.  A zero means an empty slot,
+    // which is why a fingerprint of zero is read as one.
+    var entries: Bytes
     // How many fingerprints are stored.
-    stored: Int
+    var stored: Int
 
 // An empty filter sized for `capacity` items at a rate of `target`.
 //
-// The bucket count is the next power of two above
-// `capacity / (entries_per_bucket x 0.95)` — the 0.95 is the load
-// factor a four-way cuckoo filter reaches reliably — and the
-// fingerprint width comes from the target rate.
+// The bucket count is the smallest power of two at or above
+// `capacity / (entries_per_bucket x 0.95)`, where 0.95 is the load
+// factor a four-way cuckoo filter reaches reliably.  The fingerprint
+// width is `ceil(log2(2 x entries_per_bucket / target))` bits, at most
+// 32, which is the bound of Fan et al. section 5.1.
 //
 // ```novo
 // use blcuckoo
@@ -77,15 +75,24 @@ pub struct BlCuckooFilter
 //         Err(e) => println(e.message())
 // ```
 pub fn new(capacity: Int, target: Float, hash_id: Str) -> Result<BlCuckooFilter, blfault.BlFault>
-    todo("bloom-nv.blcuckoo.new")
+    if let Some(fault) = blshared.sizing_fault(capacity, target)
+        return Err(fault)
+    let wanted = int.to_float(capacity) / (int.to_float(PER_BUCKET) * 0.95)
+    let buckets = power_of_two_at_least(float.to_int(math.ceil(wanted)))
+    let exact = math.log(2.0 * int.to_float(PER_BUCKET) / target) / math.log(2.0)
+    var fingerprint = float.to_int(math.ceil(exact))
+    if fingerprint > 32
+        fingerprint = 32
+    Ok(empty(buckets, PER_BUCKET, fingerprint, hash_id))
 
-// The filter with one item added.
+// Adds one item to the filter, in place.
 //
-// `uniforms` supplies the randomness the evictions need; each is a
+// `uniforms` supplies the randomness the evictions need.  Each is a
 // number in `0.0 ..< 1.0`, and they are consumed only when both
-// candidate buckets are full.  Refused with `BlCuckooFull` when the
-// relocation limit is reached, which means the filter is full and the
-// caller needs a larger one.
+// candidate buckets are full, one per relocation.  Refused with
+// `BlCuckooFull` when the uniforms run out or the relocation limit is
+// reached, and then the filter is as it was before the call.  The
+// filter is full, and the caller needs a larger one.
 //
 // ```novo
 // use blcuckoo
@@ -94,16 +101,38 @@ pub fn new(capacity: Int, target: Float, hash_id: Str) -> Result<BlCuckooFilter,
 //     match blcuckoo.new(1000, 0.01, "test")
 //         Err(e) => println(e.message())
 //         Ok(f)  =>
-//             match blcuckoo.add(f, bytes.from_str("ada"), demo_hash, [])
-//                 Ok(g)  => println("${blcuckoo.stored_count(g)}")      // 1
+//             var seen = f
+//             match blcuckoo.add(seen, bytes.from_str("ada"), demo_hash, [])
+//                 Ok(_)  => println("${blcuckoo.stored_count(seen)}")   // 1
 //                 Err(e) => println(e.message())
 //
 // fn demo_hash(b: Bytes) -> Int
 //     bytes.len(b) * 2654435761
 // ```
-pub fn add(f: BlCuckooFilter, item: Bytes, hash: fn(Bytes) -> Int,
-           uniforms: [Float]) -> Result<BlCuckooFilter, blfault.BlFault>
-    todo("bloom-nv.blcuckoo.add")
+pub fn add(var f: BlCuckooFilter, item: Bytes, hash: fn(Bytes) -> Int,
+           uniforms: [Float]) -> Result<Unit, blfault.BlFault>
+    let hashed = hash(item)
+    var tag = tag_of(f, hashed)
+    let first = first_bucket(f, hashed)
+    if place(f, first, tag) or place(f, alternate(f, first, tag), tag)
+        f.stored = f.stored + 1
+        return Ok(())
+    var at = alternate(f, first, tag)
+    var moves: [(Int, Int, Int)] = []
+    for u in uniforms
+        if list.len(moves) >= KICKS
+            break
+        let slot = slot_of(f, u)
+        let evicted = entry(f, at, slot)
+        set_entry(f, at, slot, tag)
+        list.push(moves, (at, slot, evicted))
+        tag = evicted
+        at = alternate(f, at, tag)
+        if place(f, at, tag)
+            f.stored = f.stored + 1
+            return Ok(())
+    undo(f, moves)
+    Err(BlCuckooFull(list.len(moves)))
 
 // Whether the item may be in the filter.
 //
@@ -122,9 +151,12 @@ pub fn add(f: BlCuckooFilter, item: Bytes, hash: fn(Bytes) -> Int,
 //     bytes.len(b) * 2654435761
 // ```
 pub fn contains(f: BlCuckooFilter, item: Bytes, hash: fn(Bytes) -> Int) -> Bool
-    todo("bloom-nv.blcuckoo.contains")
+    let hashed = hash(item)
+    let tag = tag_of(f, hashed)
+    let first = first_bucket(f, hashed)
+    slot_holding(f, first, tag) >= 0 or slot_holding(f, alternate(f, first, tag), tag) >= 0
 
-// The filter with one matching fingerprint removed.
+// Removes one matching fingerprint from the filter, in place.
 //
 // Refused when neither candidate bucket holds the item's fingerprint,
 // which is proof it was never added.  An item added twice must be
@@ -137,22 +169,36 @@ pub fn contains(f: BlCuckooFilter, item: Bytes, hash: fn(Bytes) -> Int) -> Bool
 //     match blcuckoo.new(1000, 0.01, "test")
 //         Err(e) => println(e.message())
 //         Ok(f)  =>
-//             match blcuckoo.remove(f, bytes.from_str("ada"), demo_hash)
+//             var seen = f
+//             match blcuckoo.remove(seen, bytes.from_str("ada"), demo_hash)
 //                 Ok(_)  => println("removed")
 //                 Err(e) => println(e.message())
 //
 // fn demo_hash(b: Bytes) -> Int
 //     bytes.len(b) * 2654435761
 // ```
-pub fn remove(f: BlCuckooFilter, item: Bytes,
-              hash: fn(Bytes) -> Int) -> Result<BlCuckooFilter, blfault.BlFault>
-    todo("bloom-nv.blcuckoo.remove")
+pub fn remove(var f: BlCuckooFilter, item: Bytes,
+              hash: fn(Bytes) -> Int) -> Result<Unit, blfault.BlFault>
+    let hashed = hash(item)
+    let tag = tag_of(f, hashed)
+    let first = first_bucket(f, hashed)
+    let second = alternate(f, first, tag)
+    let in_first = slot_holding(f, first, tag)
+    if in_first >= 0
+        set_entry(f, first, in_first, 0)
+    else
+        let in_second = slot_holding(f, second, tag)
+        if in_second < 0
+            return Err(BlRemoveOfUnknownItem)
+        set_entry(f, second, in_second, 0)
+    f.stored = f.stored - 1
+    Ok(())
 
 // How many uniform numbers one `add` may consume.
 //
-// The relocation limit.  A caller drawing from an expensive generator
-// passes fewer and handles the refusal; a caller that wants the insert
-// to have every chance passes this many.
+// The relocation limit, 500.  A caller drawing from an expensive
+// generator passes fewer and handles the refusal.  A caller that wants
+// the insert to have every chance passes this many.
 //
 // ```novo
 // use blcuckoo
@@ -163,7 +209,7 @@ pub fn remove(f: BlCuckooFilter, item: Bytes,
 //         Err(e) => println(e.message())
 // ```
 pub fn uniforms_needed(f: BlCuckooFilter) -> Int
-    todo("bloom-nv.blcuckoo.uniforms_needed")
+    KICKS
 
 // How many fingerprints are stored.
 //
@@ -176,7 +222,7 @@ pub fn uniforms_needed(f: BlCuckooFilter) -> Int
 //         Err(e) => println(e.message())
 // ```
 pub fn stored_count(f: BlCuckooFilter) -> Int
-    todo("bloom-nv.blcuckoo.stored_count")
+    f.stored
 
 // How many fingerprints the filter has room for.
 //
@@ -192,7 +238,7 @@ pub fn stored_count(f: BlCuckooFilter) -> Int
 //         Err(e) => println(e.message())
 // ```
 pub fn capacity_of(f: BlCuckooFilter) -> Int
-    todo("bloom-nv.blcuckoo.capacity_of")
+    f.buckets * f.entries_per_bucket
 
 // How full the filter is, as a fraction of its slots.
 //
@@ -208,9 +254,11 @@ pub fn capacity_of(f: BlCuckooFilter) -> Int
 //         Err(e) => println(e.message())
 // ```
 pub fn load_factor(f: BlCuckooFilter) -> Float
-    todo("bloom-nv.blcuckoo.load_factor")
+    int.to_float(f.stored) / int.to_float(capacity_of(f))
 
-// The false-positive rate the fingerprint width gives.
+// The false-positive rate the fingerprint width gives:
+// `2 x entries_per_bucket / 2^fingerprint_bits`, the bound for a full
+// filter.
 //
 // ```novo
 // use blcuckoo
@@ -221,9 +269,15 @@ pub fn load_factor(f: BlCuckooFilter) -> Float
 //         Err(e) => println(e.message())
 // ```
 pub fn false_positive_rate(f: BlCuckooFilter) -> Float
-    todo("bloom-nv.blcuckoo.false_positive_rate")
+    2.0 * int.to_float(f.entries_per_bucket) / int.to_float(1 << f.fingerprint_bits)
 
 // The filter as bytes, carrying its shape and hash label.
+//
+// The layout is this package's own: the four bytes `NVCF`, a version
+// byte `1`, then big-endian the bucket count (8 bytes), the entries
+// per bucket (1), the fingerprint width in bits (1) and the stored
+// count (8), the hash label as a 16-bit length and its bytes, and the
+// entries.
 //
 // ```novo
 // use blcuckoo
@@ -234,9 +288,18 @@ pub fn false_positive_rate(f: BlCuckooFilter) -> Float
 //         Err(e) => println(e.message())
 // ```
 pub fn to_bytes(f: BlCuckooFilter) -> Bytes
-    todo("bloom-nv.blcuckoo.to_bytes")
+    let head = blshared.header(MAGIC, [
+        (f.buckets, 8),
+        (f.entries_per_bucket, 1),
+        (f.fingerprint_bits, 1),
+        (f.stored, 8)],
+    f.hash_id)
+    bytes.concat([head, f.entries])
 
-// A filter read back from bytes.
+// A filter read back from bytes that `to_bytes` wrote.
+//
+// Refused as `BlBadSerialisedForm`, saying why, when the magic, the
+// version, a size or the length of the entries is wrong.
 //
 // ```novo
 // use blcuckoo
@@ -247,4 +310,114 @@ pub fn to_bytes(f: BlCuckooFilter) -> Bytes
 //         Err(e) => println(e.message())
 // ```
 pub fn from_bytes(b: Bytes) -> Result<BlCuckooFilter, blfault.BlFault>
-    todo("bloom-nv.blcuckoo.from_bytes")
+    let (fields, label, from) = blshared.read_header(b, MAGIC, [8, 1, 1, 8])!
+    let buckets = fields[0]
+    let per_bucket = fields[1]
+    let fingerprint = fields[2]
+    if buckets < 1 or power_of_two_at_least(buckets) != buckets or per_bucket < 1 or fingerprint < 1 or fingerprint > 32 or fields[3] < 0
+        return Err(BlBadSerialisedForm("a size in the header is out of range"))
+    if let Some(fault) = blshared.payload_fault(b, from, buckets * per_bucket * width_of(fingerprint))
+        return Err(fault)
+    Ok(BlCuckooFilter {
+        buckets: buckets,
+        entries_per_bucket: per_bucket,
+        fingerprint_bits: fingerprint,
+        hash_id: label,
+        entries: bytes.slice(b, from, bytes.len(b)),
+        stored: fields[3] })
+
+// The four bytes a serialised cuckoo filter starts with.
+const MAGIC: Str = "NVCF"
+
+// The entries per bucket a new filter has.
+const PER_BUCKET: Int = 4
+
+// The most relocations one insert makes.
+const KICKS: Int = 500
+
+fn empty(buckets: Int, per_bucket: Int, fingerprint: Int, hash_id: Str) -> BlCuckooFilter
+    BlCuckooFilter {
+        buckets: buckets,
+        entries_per_bucket: per_bucket,
+        fingerprint_bits: fingerprint,
+        hash_id: hash_id,
+        entries: bytes.zeros(buckets * per_bucket * width_of(fingerprint)),
+        stored: 0 }
+
+// The smallest power of two at or above `n`, and at least one.
+fn power_of_two_at_least(n: Int) -> Int
+    var p = 1
+    for _ in 0..62
+        if p >= n
+            break
+        p = p * 2
+    p
+
+// The bytes one fingerprint of `bits` bits is stored in.
+fn width_of(bits: Int) -> Int
+    if bits <= 8
+        return 1
+    if bits <= 16
+        return 2
+    4
+
+// The low `fingerprint_bits` bits of the hash, with zero read as one.
+fn tag_of(f: BlCuckooFilter, hashed: Int) -> Int
+    let tag = hashed & ((1 << f.fingerprint_bits) - 1)
+    if tag == 0
+        return 1
+    tag
+
+// The high 32 bits of the hash, modulo the bucket count.
+fn first_bucket(f: BlCuckooFilter, hashed: Int) -> Int
+    blshared.high_half(hashed) & (f.buckets - 1)
+
+// The other bucket a fingerprint in bucket `i` may live in.
+fn alternate(f: BlCuckooFilter, i: Int, tag: Int) -> Int
+    (i ^ int.wrapping_mul(tag, 0x5bd1e995)) & (f.buckets - 1)
+
+// The entry a uniform picks within a bucket.
+fn slot_of(f: BlCuckooFilter, u: Float) -> Int
+    let slot = float.to_int(u * int.to_float(f.entries_per_bucket))
+    if slot < 0
+        return 0
+    if slot >= f.entries_per_bucket
+        return f.entries_per_bucket - 1
+    slot
+
+fn entry(f: BlCuckooFilter, bucket: Int, slot: Int) -> Int
+    let w = width_of(f.fingerprint_bits)
+    let off = (bucket * f.entries_per_bucket + slot) * w
+    match w
+        1 => bytes.byte_at(f.entries, off) ?? 0
+        2 => bytes.u16_be_at(f.entries, off) ?? 0
+        _ => bytes.u32_be_at(f.entries, off) ?? 0
+
+fn set_entry(var f: BlCuckooFilter, bucket: Int, slot: Int, tag: Int)
+    let w = width_of(f.fingerprint_bits)
+    let off = (bucket * f.entries_per_bucket + slot) * w
+    match w
+        1 => bytes.set_u8(f.entries, off, tag)
+        2 => bytes.set_u16_be(f.entries, off, tag)
+        _ => bytes.set_u32_be(f.entries, off, tag)
+
+// The first slot in `bucket` holding `tag`, or `-1`.
+fn slot_holding(f: BlCuckooFilter, bucket: Int, tag: Int) -> Int
+    for slot in 0..f.entries_per_bucket
+        if entry(f, bucket, slot) == tag
+            return slot
+    0 - 1
+
+// Puts `tag` in an empty slot of `bucket`, answering whether there was
+// one.
+fn place(var f: BlCuckooFilter, bucket: Int, tag: Int) -> Bool
+    let slot = slot_holding(f, bucket, 0)
+    if slot < 0
+        return false
+    set_entry(f, bucket, slot, tag)
+    true
+
+// Puts back, last first, what each relocation took out.
+fn undo(var f: BlCuckooFilter, moves: [(Int, Int, Int)])
+    for (bucket, slot, evicted) in list.rev(moves)
+        set_entry(f, bucket, slot, evicted)

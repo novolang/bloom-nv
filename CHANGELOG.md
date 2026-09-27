@@ -5,6 +5,41 @@ All notable changes to bloom-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## [0.1.0] — 2026-09-27
+
+The first implementation of the interface published as 0.0.1.
+
+### Changed
+
+- A filter is changed in place.  `blbloom.add` and `.add_hashed` take
+  the filter as a `var` parameter and answer nothing.
+  `blcounting.add`, `.remove`, `blcuckoo.add` and `.remove` take it as
+  a `var` parameter and answer `Result<Unit, BlFault>`.  In 0.0.1 each
+  answered a new filter, and under reference semantics that is a copy
+  of the whole bitmap on every add.  A program keeps a filter in a
+  `var` binding.  A refused add or remove changes nothing.
+- `BloomFilter` has a `target` field, which `blbloom.target_rate`
+  reads, and its `bitmap` and `inserted` fields are `var`, as are the
+  counters, the entries and the counts of the other two filters.
+- `blbloom.with_bits` refuses a bit count or a hash count below one as
+  `BlCapacityNotPositive`, and sets the capacity to `m ln 2 / k`.
+- The counting filter is four times the memory of a plain one.  The
+  README said sixteen.
+- The README no longer says the package builds for a microcontroller.
+  The filters hold `Bytes` and a `Str`, and a device build admits
+  neither.
+
+### Added
+
+- The serialised layouts, documented at each `to_bytes`: `NVBF`,
+  `NVCB` and `NVCF`, a version byte, big-endian fields, the hash label
+  and the payload.
+- `tests/layout_tests.nv`, positions and bytes worked out by hand, and
+  `tests/rate_tests.nv`, the false-positive rate measured over seeded
+  keys.
+- `tests/coverage.sh`, which merges the suites' line coverage over
+  `src/`.
+
 ## [0.0.1] — 2026-09-17
 
 **The interface, published before anyone implements it.** Every public
