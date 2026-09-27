@@ -1,18 +1,16 @@
 [package]
 name        = "bloom-nv"
-version     = "0.0.1"
+version     = "0.1.0"
 description = "Bloom, counting Bloom and cuckoo filters sized from a false-positive target and an expected item count, serialisable, over a 64-bit hash the caller passes in.  Every operation that could turn the structure's one-sided error into a false negative is refused rather than performed."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental` because no program outside this repository has used the
+# package yet, and the tests were written against the signatures rather
+# than by a consumer.
+stability   = "experimental"
 
 # `core`.  A filter is bit arithmetic over a byte array.  The hash
-# arrives as a `fn(Bytes) -> Int` PARAMETER and a cuckoo filter's
+# arrives as a `fn(Bytes) -> Int` parameter and a cuckoo filter's
 # evictions take the uniforms the caller drew, so nothing here needs
 # `[rand]`, a clock or a file.
 layer       = "core"
@@ -22,7 +20,7 @@ category    = "tooling"
 tags        = ["bloom-filter", "cuckoo-filter", "counting-bloom", "probabilistic", "membership", "tooling"]
 repository  = "https://github.com/novolang/bloom-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.9.0"
+novo        = ">= 0.13.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
