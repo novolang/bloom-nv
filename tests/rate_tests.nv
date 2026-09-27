@@ -1,0 +1,173 @@
+// rate_tests.nv — the false-positive rate, measured.
+//
+// Each filter is filled with seeded keys and then asked about as many
+// keys that were never added.  The share of `true` answers among those
+// is the measured false-positive rate, and it is compared with the rate
+// the formula gives at the same fill.  The keys are `"in-<n>"` and
+// `"out-<n>"`, hashed with FNV-1a 64 followed by the SplitMix64
+// finaliser, so every run measures the same numbers.
+//
+// A measured rate is a sample.  With 20000 questions at a rate near one
+// per cent, its standard deviation is about 0.07 per cent, so the
+// bounds below leave a margin of more than five deviations.
+
+use std.test
+use blbloom
+use blcounting
+use blcuckoo
+use blfault
+
+// FNV-1a 64 over the bytes, then SplitMix64's finaliser, so that every
+// bit of the answer depends on every byte of the key.
+fn key_hash(b: Bytes) -> Int
+    var h = 0 - 3750763034362895579
+    for i in 0..bytes.len(b)
+        h = h ^ (bytes.byte_at(b, i) ?? 0)
+        h = int.wrapping_mul(h, 1099511628211)
+    h = h ^ (h >>> 30)
+    h = int.wrapping_mul(h, 0 - 4658895280553007687)
+    h = h ^ (h >>> 27)
+    h = int.wrapping_mul(h, 0 - 7723592293110705685)
+    h ^ (h >>> 31)
+
+fn key(prefix: Str, n: Int) -> Bytes
+    bytes.from_str("${prefix}-${n}")
+
+// The next state of a linear congruential generator: the constants of
+// the C standard's example `rand`, modulo 2^31.
+fn step(state: Int) -> Int
+    (state * 1103515245 + 12345) % 2147483648
+
+@test
+fn test_a_bloom_filter_at_capacity_meets_its_target() [io]
+    var f = blbloom.new(2000, 0.01, "fnv1a-splitmix")!
+    for n in 0..2000
+        blbloom.add(f, key("in", n), key_hash)
+
+    test.case("every added key is found")
+    var missing = 0
+    for n in 0..2000
+        if not blbloom.contains(f, key("in", n), key_hash)
+            missing = missing + 1
+    test.assert(missing == 0)
+
+    test.case("the formula at this fill is close to the target")
+    let predicted = blbloom.false_positive_rate(f)
+    test.assert(predicted > 0.008 and predicted < 0.0105)
+
+    test.case("the measured rate over 20000 other keys is within the bound")
+    var wrong = 0
+    for n in 0..20000
+        if blbloom.contains(f, key("out", n), key_hash)
+            wrong = wrong + 1
+    let measured = int.to_float(wrong) / 20000.0
+    test.assert(measured < predicted * 1.5)
+    test.assert(measured > predicted * 0.5)
+
+@test
+fn test_a_bloom_filter_past_capacity_measures_the_rate_it_reports() [io]
+    var f = blbloom.new(500, 0.01, "fnv1a-splitmix")!
+    for n in 0..1500
+        blbloom.add(f, key("in", n), key_hash)
+    let predicted = blbloom.false_positive_rate(f)
+
+    test.case("three times the capacity is a rate well above the target")
+    test.assert(blbloom.is_saturated(f))
+    test.assert(predicted > 0.1)
+
+    test.case("and the measured rate follows the reported one, not the target")
+    var wrong = 0
+    for n in 0..20000
+        if blbloom.contains(f, key("out", n), key_hash)
+            wrong = wrong + 1
+    let measured = int.to_float(wrong) / 20000.0
+    test.assert(measured < predicted * 1.2)
+    test.assert(measured > predicted * 0.8)
+
+@test
+fn test_a_counting_filter_forgets_exactly_what_was_removed() [io]
+    var f = blcounting.new(2000, 0.01, "fnv1a-splitmix")!
+    for n in 0..2000
+        blcounting.add(f, key("in", n), key_hash)!
+    for n in 0..1000
+        blcounting.remove(f, key("in", n), key_hash)!
+
+    test.case("the keys still present are all found")
+    var missing = 0
+    for n in 1000..2000
+        if not blcounting.contains(f, key("in", n), key_hash)
+            missing = missing + 1
+    test.assert(missing == 0)
+    test.assert(blcounting.present_count(f) == 1000)
+
+    test.case("the removed keys answer as keys never added do, at the rate of the current fill")
+    let predicted = blcounting.false_positive_rate(f)
+    var wrong = 0
+    for n in 0..1000
+        if blcounting.contains(f, key("in", n), key_hash)
+            wrong = wrong + 1
+    for n in 0..19000
+        if blcounting.contains(f, key("out", n), key_hash)
+            wrong = wrong + 1
+    let measured = int.to_float(wrong) / 20000.0
+    test.assert(measured < predicted * 1.5 + 0.0005)
+
+@test
+fn test_a_cuckoo_filter_at_its_load_limit_meets_its_bound() [io]
+    var f = blcuckoo.new(2000, 0.01, "fnv1a-splitmix")!
+    var state = 20260927
+    var uniforms: [Float] = []
+    for _ in 0..blcuckoo.uniforms_needed(f)
+        state = step(state)
+        list.push(uniforms, int.to_float(state) / 2147483648.0)
+
+    test.case("the keys go in up to 95 per cent of the slots")
+    let target_load = blcuckoo.capacity_of(f) * 95 / 100
+    var refused = 0
+    for n in 0..target_load
+        match blcuckoo.add(f, key("in", n), key_hash, uniforms)
+            Ok(_)  =>
+                refused = refused + 0
+            Err(_) =>
+                refused = refused + 1
+    test.assert(refused == 0)
+    test.assert(blcuckoo.load_factor(f) > 0.94)
+
+    test.case("every added key is found")
+    var missing = 0
+    for n in 0..target_load
+        if not blcuckoo.contains(f, key("in", n), key_hash)
+            missing = missing + 1
+    test.assert(missing == 0)
+
+    test.case("the measured rate is near the bound the fingerprint width gives")
+    var wrong = 0
+    for n in 0..20000
+        if blcuckoo.contains(f, key("out", n), key_hash)
+            wrong = wrong + 1
+    // The bound is for the expected rate.  At a load of 0.95 the
+    // expected rate is about 0.95 of the bound.  The standard deviation
+    // of a sample of 20000 is about 0.0006, a thirteenth of the bound,
+    // so each margin below is more than three deviations.
+    let measured = int.to_float(wrong) / 20000.0
+    test.assert(measured < blcuckoo.false_positive_rate(f) * 1.3)
+    test.assert(measured > blcuckoo.false_positive_rate(f) * 0.5)
+
+    test.case("filling on until an insert is refused leaves every stored key found")
+    var n = target_load
+    var full = false
+    for _ in 0..blcuckoo.capacity_of(f)
+        if full
+            break
+        match blcuckoo.add(f, key("in", n), key_hash, uniforms)
+            Ok(_)  =>
+                n = n + 1
+            Err(e) =>
+                full = blfault.is_capacity_fault(e)
+    test.assert(full)
+    missing = 0
+    for m in 0..n
+        if not blcuckoo.contains(f, key("in", m), key_hash)
+            missing = missing + 1
+    test.assert(missing == 0)
+    test.assert(blcuckoo.stored_count(f) == n)

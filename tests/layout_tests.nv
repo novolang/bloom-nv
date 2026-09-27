@@ -1,0 +1,251 @@
+// layout_tests.nv — the positions and the bytes, checked by hand.
+//
+// Each expected value here was worked out on paper from the scheme the
+// module headers state, not read back from the package.  The Bloom
+// positions are Kirsch and Mitzenmacher's `g_i = (h1 + i * h2) mod m`,
+// with `h1` the low and `h2` the high 32 bits of the hash.  The
+// cuckoo placement is the reference implementation's: the fingerprint
+// from the low bits, the first bucket from the high 32 bits, and the
+// second bucket `i XOR (fingerprint * 0x5bd1e995)`.
+
+use std.test
+use blbloom
+use blcounting
+use blcuckoo
+use blfault
+
+// `h1 = 10`, `h2 = 5`: positions 10, 15, 20 among 97.
+fn ten_by_five(b: Bytes) -> Int
+    10 + (5 << 32)
+
+// High half 1, low half 42: a seven-bit fingerprint of 42 in bucket 1
+// of 4, whose other bucket is `1 XOR (42 * 0x5bd1e995 mod 4)`, which
+// is `1 XOR 2`, bucket 3.
+fn bucket_one_tag_42(b: Bytes) -> Int
+    (1 << 32) + 42
+
+// The payload of a serialised filter: what follows a header of
+// `fields` bytes of fields and the label `label`.
+fn payload(b: Bytes, fields: Int, label: Str) -> Bytes
+    let from = 5 + fields + 2 + str.len(label)
+    bytes.slice(b, from, bytes.len(b))
+
+// Why a serialised form was refused, or `""` for another fault.
+fn reason(e: blfault.BlFault) -> Str
+    match e
+        BlBadSerialisedForm(why) => why
+        _                        => ""
+
+@test
+fn test_a_bloom_item_sets_the_bits_the_formula_names() [io]
+    var f = blbloom.with_bits(97, 3, "hand")!
+    blbloom.add_hashed(f, ten_by_five(bytes.from_str("")))
+    let bitmap = payload(blbloom.to_bytes(f), 8 + 4 + 8 + 8 + 8, "hand")
+
+    test.case("97 bits are 13 bytes")
+    test.assert(bytes.len(bitmap) == 13)
+
+    test.case("bit 10 is bit 2 of byte 1, bit 15 is bit 7 of byte 1, bit 20 is bit 4 of byte 2")
+    test.assert(bytes.to_hex(bitmap) == "00841000000000000000000000")
+
+    test.case("an item whose positions are those three is reported present")
+    // h1 = 20, h2 = 92: 20, 112 mod 97 = 15, 204 mod 97 = 10.
+    test.assert(blbloom.contains_hashed(f, 20 + (92 << 32)))
+
+    test.case("and one that needs position 25 as well is not")
+    test.assert(blbloom.contains_hashed(f, 15 + (5 << 32)) == false)
+
+@test
+fn test_a_negative_hash_is_read_as_its_unsigned_halves() [io]
+    // -1 is h1 = h2 = 2^32 - 1, which gives 34, 68 and 5 among 97.
+    var f = blbloom.with_bits(97, 3, "hand")!
+    blbloom.add_hashed(f, 0 - 1)
+    let bitmap = payload(blbloom.to_bytes(f), 36, "hand")
+    test.case("bits 5, 34 and 68")
+    test.assert(bytes.to_hex(bitmap) == "20000000040000001000000000")
+
+@test
+fn test_counting_counters_are_nibbles_low_first() [io]
+    // 10 items at 10% is 48 counters and 3 hashes.
+    var f = blcounting.new(10, 0.1, "hand")!
+    blcounting.add(f, bytes.from_str("x"), ten_by_five)!
+    blcounting.add(f, bytes.from_str("x"), ten_by_five)!
+    let counters = payload(blcounting.to_bytes(f), 8 + 4 + 8 + 8, "hand")
+
+    test.case("48 counters are 24 bytes")
+    test.assert(bytes.len(counters) == 24)
+
+    test.case("counter 10 is the low nibble of byte 5, 15 the high nibble of byte 7, 20 the low nibble of byte 10")
+    test.assert(bytes.to_hex(counters) == "000000000002002000000200000000000000000000000000")
+
+@test
+fn test_a_counter_at_fifteen_refuses_the_next_add() [io]
+    var f = blcounting.new(10, 0.1, "hand")!
+    test.case("fifteen adds fit in a four-bit counter")
+    for _ in 0..15
+        blcounting.add(f, bytes.from_str("x"), ten_by_five)!
+    test.assert(blcounting.min_counter(f, bytes.from_str("x"), ten_by_five) == 15)
+
+    test.case("the sixteenth is refused at the first counter, and nothing changes")
+    let before = blcounting.to_bytes(f)
+    match blcounting.add(f, bytes.from_str("x"), ten_by_five)
+        Ok(_)  => test.fail("the counter would wrap to zero")
+        Err(e) =>
+            match e
+                BlCounterSaturated(index) => test.assert(index == 10)
+                _                         => test.fail("the counter at position 10 is the full one")
+    test.assert(bytes.to_hex(blcounting.to_bytes(f)) == bytes.to_hex(before))
+
+@test
+fn test_a_cuckoo_fingerprint_goes_to_its_first_bucket_then_its_second() [io]
+    // 10 items at 10% is 4 buckets of 4 and a seven-bit fingerprint.
+    var f = blcuckoo.new(10, 0.1, "hand")!
+    let x = bytes.from_str("x")
+
+    test.case("four copies fill bucket 1, bytes 4 to 7")
+    for _ in 0..4
+        blcuckoo.add(f, x, bucket_one_tag_42, [])!
+    test.assert(bytes.to_hex(payload(blcuckoo.to_bytes(f), 18, "hand")) == "000000002a2a2a2a0000000000000000")
+
+    test.case("the fifth goes to bucket 3, byte 12")
+    blcuckoo.add(f, x, bucket_one_tag_42, [])!
+    test.assert(bytes.to_hex(payload(blcuckoo.to_bytes(f), 18, "hand")) == "000000002a2a2a2a000000002a000000")
+
+    test.case("with both buckets full, an insert relocates until the uniforms run out")
+    for _ in 0..3
+        blcuckoo.add(f, x, bucket_one_tag_42, [])!
+    let before = blcuckoo.to_bytes(f)
+    match blcuckoo.add(f, x, bucket_one_tag_42, [0.1, 0.6, 0.3, 0.9, 0.5])
+        Ok(_)  => test.fail("two full buckets and nowhere else for the fingerprint to go")
+        Err(e) =>
+            match e
+                BlCuckooFull(kicks) => test.assert(kicks == 5)
+                _                   => test.fail("the filter is full after five relocations")
+
+    test.case("and the refused insert leaves the filter as it was")
+    test.assert(bytes.to_hex(blcuckoo.to_bytes(f)) == bytes.to_hex(before))
+    test.assert(blcuckoo.stored_count(f) == 8)
+
+@test
+fn test_every_serialised_form_refuses_a_damaged_header() [io]
+    let good = blbloom.to_bytes(blbloom.with_bits(97, 3, "hand")!)
+
+    test.case("a wrong version")
+    var wrong_version = bytes.clone(good)
+    bytes.set_u8(wrong_version, 4, 9)
+    match blbloom.from_bytes(wrong_version)
+        Ok(_)  => test.fail("version 9 is not one this package wrote")
+        Err(e) => test.assert(reason(e) == "the version is not 1")
+
+    test.case("a header cut short")
+    match blbloom.from_bytes(bytes.slice(good, 0, 20))
+        Ok(_)  => test.fail("the header ends early")
+        Err(e) => test.assert(blfault.code(e) == "bad_serialised_form")
+
+    test.case("a bitmap one byte short")
+    match blbloom.from_bytes(bytes.slice(good, 0, bytes.len(good) - 1))
+        Ok(_)  => test.fail("97 bits need 13 bytes")
+        Err(e) => test.assert(reason(e) == "the payload is 12 bytes, not 13")
+
+    test.case("a hash count of zero")
+    var no_hashes = bytes.clone(good)
+    bytes.set_u32_be(no_hashes, 13, 0)
+    match blbloom.from_bytes(no_hashes)
+        Ok(_)  => test.fail("a filter needs a hash count")
+        Err(e) => test.assert(blfault.code(e) == "bad_serialised_form")
+
+    test.case("the same for the counting and the cuckoo layouts")
+    let counting = blcounting.to_bytes(blcounting.new(10, 0.1, "hand")!)
+    match blcounting.from_bytes(bytes.slice(counting, 0, bytes.len(counting) - 1))
+        Ok(_)  => test.fail("the counters are one byte short")
+        Err(e) => test.assert(blfault.code(e) == "bad_serialised_form")
+    var zero_slots = bytes.clone(counting)
+    bytes.set_u64_be(zero_slots, 5, 0)
+    match blcounting.from_bytes(zero_slots)
+        Ok(_)  => test.fail("a filter needs counters")
+        Err(e) => test.assert(blfault.code(e) == "bad_serialised_form")
+    let cuckoo = blcuckoo.to_bytes(blcuckoo.new(10, 0.1, "hand")!)
+    match blcuckoo.from_bytes(bytes.slice(cuckoo, 0, bytes.len(cuckoo) - 1))
+        Ok(_)  => test.fail("the entries are one byte short")
+        Err(e) => test.assert(blfault.code(e) == "bad_serialised_form")
+    var three_buckets = bytes.clone(cuckoo)
+    bytes.set_u64_be(three_buckets, 5, 3)
+    match blcuckoo.from_bytes(three_buckets)
+        Ok(_)  => test.fail("a bucket count is a power of two")
+        Err(e) => test.assert(blfault.code(e) == "bad_serialised_form")
+
+@test
+fn test_the_edges_of_sizing() [io]
+    test.case("a bit count or a hash count below one is refused")
+    match blbloom.with_bits(0, 3, "hand")
+        Ok(_)  => test.fail("no bits")
+        Err(e) => test.assert(blfault.code(e) == "capacity_not_positive")
+    match blbloom.with_bits(97, 0, "hand")
+        Ok(_)  => test.fail("no hashes")
+        Err(e) => test.assert(blfault.code(e) == "capacity_not_positive")
+
+    test.case("one bit with five hashes is sized for one item")
+    test.assert(blbloom.is_saturated(blbloom.with_bits(1, 5, "hand")!) == false)
+
+    test.case("a target so loose that the formula gives no hash still gets one")
+    test.assert(blbloom.hash_count(blbloom.new(1000, 0.9, "hand")!) == 1)
+
+    test.case("the counting and cuckoo filters refuse the same sizing")
+    match blcounting.new(0, 0.01, "hand")
+        Ok(_)  => test.fail("no capacity")
+        Err(e) => test.assert(blfault.code(e) == "capacity_not_positive")
+    match blcuckoo.new(10, 1.0, "hand")
+        Ok(_)  => test.fail("a rate of one")
+        Err(e) => test.assert(blfault.code(e) == "target_out_of_range")
+
+@test
+fn test_an_intersection_counts_the_smaller_fill() [io]
+    var x = blbloom.with_bits(97, 3, "hand")!
+    var y = blbloom.with_bits(97, 3, "hand")!
+    blbloom.add_hashed(x, 1)
+    blbloom.add_hashed(x, 2)
+    blbloom.add_hashed(y, 1)
+    test.assert(blbloom.inserted_count(blbloom.intersection(x, y)!) == 1)
+    test.assert(blbloom.inserted_count(blbloom.intersection(y, x)!) == 1)
+
+@test
+fn test_a_wide_fingerprint_takes_four_bytes() [io]
+    // A target of one in a billion needs 33 bits, and is held at 32.
+    var f = blcuckoo.new(10, 0.000000001, "hand")!
+    test.case("the rate is the 32-bit bound")
+    test.assert(blcuckoo.false_positive_rate(f) == 8.0 / 4294967296.0)
+    test.case("and four copies of one item fill four-byte slots")
+    for _ in 0..4
+        blcuckoo.add(f, bytes.from_str("x"), bucket_one_tag_42, [])!
+    test.assert(bytes.len(payload(blcuckoo.to_bytes(f), 18, "hand")) == 4 * 4 * 4)
+    test.assert(blcuckoo.contains(f, bytes.from_str("x"), bucket_one_tag_42))
+
+@test
+fn test_relocation_stops_at_the_limit_and_reads_any_uniform() [io]
+    var f = blcuckoo.new(10, 0.1, "hand")!
+    let x = bytes.from_str("x")
+    for _ in 0..8
+        blcuckoo.add(f, x, bucket_one_tag_42, [])!
+
+    test.case("uniforms past the limit are not used")
+    var many: [Float] = []
+    for i in 0..600
+        list.push(many, int.to_float(i % 7) / 7.0 - 0.2)
+    list.push(many, 1.5)
+    match blcuckoo.add(f, x, bucket_one_tag_42, many)
+        Ok(_)  => test.fail("two full buckets and nowhere else to go")
+        Err(e) =>
+            match e
+                BlCuckooFull(kicks) => test.assert(kicks == 500)
+                _                   => test.fail("the filter is full")
+
+    test.case("a uniform of one or more picks the last entry")
+    match blcuckoo.add(f, x, bucket_one_tag_42, [1.5, 0.0 - 1.0])
+        Ok(_)  => test.fail("two full buckets and nowhere else to go")
+        Err(e) => test.assert(blfault.is_capacity_fault(e))
+
+    test.case("removing eight copies empties the first bucket and then the second")
+    for _ in 0..8
+        blcuckoo.remove(f, x, bucket_one_tag_42)!
+    test.assert(blcuckoo.stored_count(f) == 0)
+    test.assert(blcuckoo.contains(f, x, bucket_one_tag_42) == false)
